@@ -38,6 +38,13 @@ def get_behind_by(repo, base, head):
     return compare["behind_by"]
 
 
+def get_head_commit_date(repo, head):
+    return run_gh([
+        "api", f"repos/{repo}/git/commits/{head}",
+        "--jq", ".committer.date",
+    ]).strip()
+
+
 def comment_rebase(repo, number):
     run_gh([
         "pr", "comment", str(number),
@@ -101,15 +108,23 @@ def main():
                 repo, details["baseRefName"], details["headRefOid"]
             )
             if behind_by > 0:
-                already_requested = any(
-                    "@dependabot rebase" in comment["body"]
-                    for comment in details["comments"]
-                )
-                if already_requested:
-                    print(f"    behind by {behind_by}, waiting for dependabot")
-                else:
+                last_rebase_comment = next((
+                    comment for comment in reversed(details["comments"])
+                    if "@dependabot rebase" in comment["body"]
+                ), None)
+                needs_comment = True
+                if last_rebase_comment:
+                    head_commit_date = get_head_commit_date(
+                        repo, details["headRefOid"]
+                    )
+                    needs_comment = (
+                        head_commit_date > last_rebase_comment["createdAt"]
+                    )
+                if needs_comment:
                     print(f"    behind by {behind_by}, rebasing")
                     comment_rebase(repo, number)
+                else:
+                    print(f"    behind by {behind_by}, waiting for dependabot")
                 continue
         passing_conclusions = {"SUCCESS", "NEUTRAL", "SKIPPED"}
         ci_running = any(
