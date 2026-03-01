@@ -1,22 +1,3 @@
-### Eclipse ###
-
-/.project
-
-### Eclipse+Java ###
-
-/bin/
-/.classpath
-/.factorypath
-
-### IntelliJ IDEA ###
-
-/out/
-
-### Maven ###
-
-/target/
-/.flattened-pom.xml
-
 # Add custom ignores after this line to be preserved during automated updates
 
 *.db
