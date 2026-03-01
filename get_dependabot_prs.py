@@ -103,29 +103,11 @@ def main():
             continue
         details = get_pr_details(repo, number)
         label_names = {label["name"] for label in pr["labels"]}
+        behind_by = 0
         if "github_actions" in label_names:
             behind_by = get_behind_by(
                 repo, details["baseRefName"], details["headRefOid"]
             )
-            if behind_by > 0:
-                last_rebase_comment = next((
-                    comment for comment in reversed(details["comments"])
-                    if "@dependabot rebase" in comment["body"]
-                ), None)
-                needs_comment = True
-                if last_rebase_comment:
-                    head_commit_date = get_head_commit_date(
-                        repo, details["headRefOid"]
-                    )
-                    needs_comment = (
-                        head_commit_date > last_rebase_comment["createdAt"]
-                    )
-                if needs_comment:
-                    print(f"    behind by {behind_by}, rebasing")
-                    comment_rebase(repo, number)
-                else:
-                    print(f"    behind by {behind_by}, waiting for dependabot")
-                continue
         passing_conclusions = {"SUCCESS", "NEUTRAL", "SKIPPED"}
         ci_running = any(
             check["status"] != "COMPLETED"
@@ -135,7 +117,25 @@ def main():
             check["conclusion"] in passing_conclusions
             for check in details["statusCheckRollup"]
         )
-        if ci_running:
+        if behind_by > 0:
+            last_rebase_comment = next((
+                comment for comment in reversed(details["comments"])
+                if "@dependabot rebase" in comment["body"]
+            ), None)
+            needs_comment = True
+            if last_rebase_comment:
+                head_commit_date = get_head_commit_date(
+                    repo, details["headRefOid"]
+                )
+                needs_comment = (
+                    head_commit_date > last_rebase_comment["createdAt"]
+                )
+            if needs_comment:
+                print(f"    behind by {behind_by}, rebasing")
+                comment_rebase(repo, number)
+            else:
+                print(f"    behind by {behind_by}, waiting for dependabot")
+        elif ci_running:
             print("    CI running, enabling automerge")
             enable_automerge(repo, number)
         elif ci_passing:
