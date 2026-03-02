@@ -158,7 +158,6 @@ def process_pr(repository, pr):
     label_names = {label["name"] for label in pr["labels"]}
     number = pr["number"]
     label = f"{repository}#{number}"
-
     author_login = pr["author"]["login"]
 
     pr_details = get_pr_details(repository, number)
