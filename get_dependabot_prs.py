@@ -184,7 +184,7 @@ def process_pr(repository, pr, label_names, details):
         print(f"[{label}] CI failed, skipping")
 
 
-def process_repo(repository):
+def process_repository(repository):
     for pr in get_prs(repository):
         label_names = {label["name"] for label in pr["labels"]}
         details = get_pr_details(repository, pr["number"])
@@ -195,7 +195,7 @@ def main():
     with ThreadPoolExecutor() as executor:
         repositories = get_repositories()
         futures = {
-            executor.submit(process_repo, repository): repository
+            executor.submit(process_repository, repository): repository
             for repository in repositories
         }
         for f in as_completed(futures):
