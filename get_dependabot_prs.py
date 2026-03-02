@@ -28,7 +28,7 @@ def get_pr_details(repo, number):
     return json.loads(run_gh([
         "pr", "view", str(number),
         "--repo", repo,
-        "--json", "headRefOid,baseRefName,statusCheckRollup,comments",
+        "--json", "body,headRefOid,baseRefName,statusCheckRollup,comments",
     ]))
 
 
@@ -82,7 +82,24 @@ def check_ci_status(details):
     return ci_running, ci_passing
 
 
-def wait_for_ci(repo, number, label, poll_interval=30):
+def wait_for_rebase(repo, number, label, poll_interval=15):
+    """Polls until PR is no longer being rebased and is up to date with base.
+    Returns latest PR details."""
+    while True:
+        details = get_pr_details(repo, number)
+        if "Dependabot is rebasing this PR" in details["body"]:
+            print(f"  [{label}] dependabot is rebasing, waiting {poll_interval}s...")
+            time.sleep(poll_interval)
+            continue
+        behind_by = get_behind_by(repo, details["baseRefName"], details["headRefOid"])
+        if behind_by > 0:
+            print(f"  [{label}] still behind by {behind_by}, waiting {poll_interval}s...")
+            time.sleep(poll_interval)
+            continue
+        return details
+
+
+def wait_for_ci(repo, number, label, poll_interval=15):
     """Polls PR CI status until all checks complete. Returns ci_passing bool."""
     while True:
         details = get_pr_details(repo, number)
@@ -99,73 +116,39 @@ def process_pr(repo, pr, label_names, details):
     number = pr["number"]
 
     if "Dependabot is rebasing this PR" in pr["body"]:
-        return f"[{label}] dependabot is rebasing, skipping"
-
-    behind_by = 0
-    if "github_actions" in label_names:
+        print(f"  [{label}] dependabot is rebasing, waiting...")
+        details = wait_for_rebase(repo, number, label)
+    elif "github_actions" in label_names:
         behind_by = get_behind_by(repo, details["baseRefName"], details["headRefOid"])
+        if behind_by > 0:
+            last_rebase_comment = next((
+                comment for comment in reversed(details["comments"])
+                if "@dependabot rebase" in comment["body"]
+            ), None)
+            needs_comment = True
+            if last_rebase_comment:
+                head_commit_date = get_head_commit_date(repo, details["headRefOid"])
+                needs_comment = (head_commit_date > last_rebase_comment["createdAt"])
+            if needs_comment:
+                comment_rebase(repo, number)
+                print(f"  [{label}] behind by {behind_by}, rebasing")
+            else:
+                print(f"  [{label}] behind by {behind_by}, waiting for dependabot")
+            details = wait_for_rebase(repo, number, label)
 
     ci_running, ci_passing = check_ci_status(details)
-
-    if behind_by > 0:
-        last_rebase_comment = next((
-            comment for comment in reversed(details["comments"])
-            if "@dependabot rebase" in comment["body"]
-        ), None)
-        needs_comment = True
-        if last_rebase_comment:
-            head_commit_date = get_head_commit_date(repo, details["headRefOid"])
-            needs_comment = (head_commit_date > last_rebase_comment["createdAt"])
-        if needs_comment:
-            comment_rebase(repo, number)
-            return f"[{label}] behind by {behind_by}, rebasing"
-        else:
-            return f"[{label}] behind by {behind_by}, waiting for dependabot"
-
     if ci_running:
         ci_passing = wait_for_ci(repo, number, label)
 
     if ci_passing:
         merge_pr(repo, number)
-        return f"[{label}] CI done, merging"
+        return f"[{label}] merged"
     else:
         return f"[{label}] CI failed, skipping"
 
 
-def process_repo(repo, prs, executor):
-    """Process all PRs for a single repo.
-    - non-github_actions PRs: submitted to thread pool in parallel
-    - github_actions PRs: processed one at a time (serial)
-    """
-    github_actions_prs = []
-    other_prs = []
-    for pr in prs:
-        label_names = {label["name"] for label in pr["labels"]}
-        if "github_actions" in label_names:
-            github_actions_prs.append((pr, label_names))
-        else:
-            other_prs.append((pr, label_names))
-
-    # Submit non-github_actions PRs in parallel
-    futures = []
-    for pr, label_names in other_prs:
-        details = get_pr_details(repo, pr["number"])
-        future = executor.submit(process_pr, repo, pr, label_names, details)
-        futures.append(future)
-
-    # Process github_actions PRs serially
-    for pr, label_names in github_actions_prs:
-        details = get_pr_details(repo, pr["number"])
-        result = process_pr(repo, pr, label_names, details)
-        print(result)
-
-    # Collect parallel results
-    for f in as_completed(futures):
-        print(f.result())
-
-
-def get_dependabot_prs_for_repo(repo):
-    """Returns list of open dependabot PRs for a single repo."""
+def process_repo(repo):
+    """Fetch and process all dependabot PRs for a single repo serially."""
     output = run_gh([
         "pr", "list",
         "--repo", repo,
@@ -175,9 +158,17 @@ def get_dependabot_prs_for_repo(repo):
         "--limit", "100",
     ])
     prs = json.loads(output)
+    if not prs:
+        return
+
     for pr in prs:
-        pr["repository"] = {"nameWithOwner": repo}
-    return prs
+        print(f"  #{pr['number']} [{repo}] {pr['title']}")
+        print(f"    {pr['url']}  (created: {pr['createdAt'][:10]})")
+
+    for pr in prs:
+        label_names = {label["name"] for label in pr["labels"]}
+        details = get_pr_details(repo, pr["number"])
+        print(process_pr(repo, pr, label_names, details))
 
 
 def main():
@@ -190,35 +181,9 @@ def main():
     repos = [r["nameWithOwner"] for r in json.loads(repos_output)]
 
     with ThreadPoolExecutor() as executor:
-        # Fetch PRs for all repos in parallel
-        pr_futures = {
-            executor.submit(get_dependabot_prs_for_repo, repo): repo
-            for repo in repos
-        }
-        by_repo = {}
-        for f in as_completed(pr_futures):
-            prs = f.result()
-            if prs:
-                repo = prs[0]["repository"]["nameWithOwner"]
-                by_repo[repo] = prs
-
-        if not by_repo:
-            print("No open pull requests found.")
-            return
-
-        total = sum(len(prs) for prs in by_repo.values())
-        print(f"Found {total} open pull request(s):\n")
-        for repo, prs in sorted(by_repo.items()):
-            for pr in prs:
-                print(f"  #{pr['number']} [{repo}] {pr['title']}")
-                print(f"    {pr['url']}  (created: {pr['createdAt'][:10]})")
-
-        print()
-
-        # Process each repo in parallel
         repo_futures = {
-            executor.submit(process_repo, repo, repo_prs, executor): repo
-            for repo, repo_prs in by_repo.items()
+            executor.submit(process_repo, repo): repo
+            for repo in repos
         }
         for f in as_completed(repo_futures):
             f.result()  # re-raise exceptions
