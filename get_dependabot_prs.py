@@ -80,6 +80,7 @@ def main():
         "search", "prs",
         search_term,
         "--owner", "arlol",
+        #"--author", "app/renovate",
         "--author", "app/dependabot",
         "--state", "open",
         "--archived=false",
@@ -110,11 +111,15 @@ def main():
             )
         passing_conclusions = {"SUCCESS", "NEUTRAL", "SKIPPED"}
         ci_running = any(
-            check["status"] != "COMPLETED"
+            check.get("status", "COMPLETED") != "COMPLETED"
+            if "status" in check
+            else check.get("state") in {"EXPECTED", "PENDING"}
             for check in details["statusCheckRollup"]
         )
         ci_passing = all(
             check["conclusion"] in passing_conclusions
+            if "status" in check
+            else check.get("state") == "SUCCESS"
             for check in details["statusCheckRollup"]
         )
         if behind_by > 0:
