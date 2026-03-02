@@ -194,11 +194,11 @@ def process_repo(repository):
 def main():
     with ThreadPoolExecutor() as executor:
         repositories = get_repositories()
-        repo_futures = {
+        futures = {
             executor.submit(process_repo, repository): repository
             for repository in repositories
         }
-        for f in as_completed(repo_futures):
+        for f in as_completed(futures):
             f.result()  # re-raise exceptions
 
 
