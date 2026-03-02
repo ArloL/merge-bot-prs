@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Lists all open pull requests in the arlol organization made by dependabot
-or renovate, and triggers a rebase on any with the github_actions/github-actions label
-that are behind main.
+Processes all open pull requests in the arlol organization made by dependabot
+or renovate, and tries to do the right thing to merge them.
 """
 
 import json
@@ -64,26 +63,26 @@ def get_head_commit_date(repository, head):
     ]).strip()
 
 
-def is_currently_rebasing(body):
+def is_currently_rebasing(pr_details):
     return (
-        "Dependabot is rebasing this PR" in body
-        or "- [x] <!-- rebase-check -->" in body
+        "Dependabot is rebasing this PR" in pr_details["body"]
+        or "- [x] <!-- rebase-check -->" in pr_details["body"]
     )
 
 
-def rebase_already_triggered(repository, author_login, details):
+def rebase_already_triggered(repository, author_login, pr_details):
     """Returns True if a rebase has already been requested and we should wait."""
     if "dependabot" in author_login:
         last_rebase_comment = next((
-            comment for comment in reversed(details["comments"])
+            comment for comment in reversed(pr_details["comments"])
             if "@dependabot rebase" in comment["body"]
         ), None)
         if not last_rebase_comment:
             return False
-        head_commit_date = get_head_commit_date(repository, details["headRefOid"])
+        head_commit_date = get_head_commit_date(repository, pr_details["headRefOid"])
         return head_commit_date <= last_rebase_comment["createdAt"]
     else:
-        return "- [x] <!-- rebase-check -->" in details["body"]
+        return "- [x] <!-- rebase-check -->" in pr_details["body"]
 
 
 def trigger_rebase(repository, number, author_login, body):
@@ -109,10 +108,10 @@ def merge_pr(repository, number):
     ])
 
 
-def check_ci_status(details):
+def check_ci_status(pr_details):
     """Returns (ci_running, ci_passing) tuple."""
     passing_conclusions = {"SUCCESS", "NEUTRAL", "SKIPPED"}
-    checks = details["statusCheckRollup"]
+    checks = pr_details["statusCheckRollup"]
     ci_running = any(
         check.get("status", "COMPLETED") != "COMPLETED"
         if "status" in check
@@ -130,50 +129,52 @@ def check_ci_status(details):
 
 def wait_for_rebase(repository, number, label, poll_interval=15):
     """Polls until PR is no longer being rebased and is up to date with base.
-    Returns latest PR details."""
+    Returns latest PR pr_details."""
     while True:
-        details = get_pr_details(repository, number)
-        if is_currently_rebasing(details["body"]):
+        pr_details = get_pr_details(repository, number)
+        if is_currently_rebasing(pr_details):
             print(f"[{label}] rebasing, waiting {poll_interval}s...")
             time.sleep(poll_interval)
             continue
-        if details["mergeStateStatus"] == "BEHIND":
+        if pr_details["mergeStateStatus"] == "BEHIND":
             print(f"[{label}] still behind, waiting {poll_interval}s...")
             time.sleep(poll_interval)
             continue
-        return details
+        return pr_details
 
 
 def wait_for_ci(repository, number, label, poll_interval=15):
     """Polls PR CI status until all checks complete. Returns ci_passing bool."""
     while True:
-        details = get_pr_details(repository, number)
-        ci_running, ci_passing = check_ci_status(details)
+        pr_details = get_pr_details(repository, number)
+        ci_running, ci_passing = check_ci_status(pr_details)
         if not ci_running:
             return ci_passing
         print(f"[{label}] CI still running, waiting {poll_interval}s...")
         time.sleep(poll_interval)
 
 
-def process_pr(repository, pr, label_names, details):
-    label = f"{repository}#{pr['number']}"
+def process_pr(repository, pr):
+    label_names = {label["name"] for label in pr["labels"]}
     number = pr["number"]
+    label = f"{repository}#{number}"
 
     author_login = pr["author"]["login"]
 
-    if is_currently_rebasing(details["body"]):
+    pr_details = get_pr_details(repository, number)
+    if is_currently_rebasing(pr_details):
         print(f"[{label}] rebasing, waiting...")
-        details = wait_for_rebase(repository, number, label)
+        pr_details = wait_for_rebase(repository, number, label)
     elif label_names & {"github_actions", "github-actions"}:
-        if details["mergeStateStatus"] == "BEHIND":
-            if rebase_already_triggered(repository, author_login, details):
+        if pr_details["mergeStateStatus"] == "BEHIND":
+            if rebase_already_triggered(repository, author_login, pr_details):
                 print(f"[{label}] behind, waiting for rebase")
             else:
-                trigger_rebase(repository, number, author_login, details["body"])
+                trigger_rebase(repository, number, author_login, pr_details["body"])
                 print(f"[{label}] behind, rebasing")
-            details = wait_for_rebase(repository, number, label)
+            pr_details = wait_for_rebase(repository, number, label)
 
-    ci_running, ci_passing = check_ci_status(details)
+    ci_running, ci_passing = check_ci_status(pr_details)
     if ci_running:
         ci_passing = wait_for_ci(repository)
 
@@ -186,9 +187,7 @@ def process_pr(repository, pr, label_names, details):
 
 def process_repository(repository):
     for pr in get_prs(repository):
-        label_names = {label["name"] for label in pr["labels"]}
-        details = get_pr_details(repository, pr["number"])
-        process_pr(repository, pr, label_names, details)
+        process_pr(repository, pr)
 
 
 def main():
@@ -198,8 +197,8 @@ def main():
             executor.submit(process_repository, repository): repository
             for repository in repositories
         }
-        for f in as_completed(futures):
-            f.result()  # re-raise exceptions
+        for future in as_completed(futures):
+            future.result()  # re-raise exceptions
 
 
 if __name__ == "__main__":
