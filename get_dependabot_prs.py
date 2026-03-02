@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Lists all open pull requests in the arlol organization made by dependabot,
-and comments @dependabot rebase on any with the github_actions label that
-are behind main.
+Lists all open pull requests in the arlol organization made by dependabot
+or renovate, and triggers a rebase on any with the github_actions/github-actions label
+that are behind main.
 """
 
 import json
@@ -47,12 +47,41 @@ def get_head_commit_date(repo, head):
     ]).strip()
 
 
-def comment_rebase(repo, number):
-    run_gh([
-        "pr", "comment", str(number),
-        "--repo", repo,
-        "--body", "@dependabot rebase",
-    ])
+def is_currently_rebasing(body):
+    return (
+        "Dependabot is rebasing this PR" in body
+        or "- [x] <!-- rebase-check -->" in body
+    )
+
+
+def rebase_already_triggered(repo, author_login, details):
+    """Returns True if a rebase has already been requested and we should wait."""
+    if "dependabot" in author_login:
+        last_rebase_comment = next((
+            comment for comment in reversed(details["comments"])
+            if "@dependabot rebase" in comment["body"]
+        ), None)
+        if not last_rebase_comment:
+            return False
+        head_commit_date = get_head_commit_date(repo, details["headRefOid"])
+        return head_commit_date <= last_rebase_comment["createdAt"]
+    else:
+        return "- [x] <!-- rebase-check -->" in details["body"]
+
+
+def trigger_rebase(repo, number, author_login, body):
+    if "dependabot" in author_login:
+        run_gh([
+            "pr", "comment", str(number),
+            "--repo", repo,
+            "--body", "@dependabot rebase",
+        ])
+    else:
+        new_body = body.replace(
+            "- [ ] <!-- rebase-check -->",
+            "- [x] <!-- rebase-check -->",
+        )
+        run_gh(["pr", "edit", str(number), "--repo", repo, "--body", new_body])
 
 
 def merge_pr(repo, number):
@@ -87,8 +116,8 @@ def wait_for_rebase(repo, number, label, poll_interval=15):
     Returns latest PR details."""
     while True:
         details = get_pr_details(repo, number)
-        if "Dependabot is rebasing this PR" in details["body"]:
-            print(f"  [{label}] dependabot is rebasing, waiting {poll_interval}s...")
+        if is_currently_rebasing(details["body"]):
+            print(f"  [{label}] rebasing, waiting {poll_interval}s...")
             time.sleep(poll_interval)
             continue
         behind_by = get_behind_by(repo, details["baseRefName"], details["headRefOid"])
@@ -115,25 +144,19 @@ def process_pr(repo, pr, label_names, details):
     label = f"{repo}#{pr['number']}"
     number = pr["number"]
 
-    if "Dependabot is rebasing this PR" in pr["body"]:
-        print(f"  [{label}] dependabot is rebasing, waiting...")
+    author_login = pr["author"]["login"]
+
+    if is_currently_rebasing(pr["body"]):
+        print(f"  [{label}] rebasing, waiting...")
         details = wait_for_rebase(repo, number, label)
-    elif "github_actions" in label_names:
+    elif label_names & {"github_actions", "github-actions"}:
         behind_by = get_behind_by(repo, details["baseRefName"], details["headRefOid"])
         if behind_by > 0:
-            last_rebase_comment = next((
-                comment for comment in reversed(details["comments"])
-                if "@dependabot rebase" in comment["body"]
-            ), None)
-            needs_comment = True
-            if last_rebase_comment:
-                head_commit_date = get_head_commit_date(repo, details["headRefOid"])
-                needs_comment = (head_commit_date > last_rebase_comment["createdAt"])
-            if needs_comment:
-                comment_rebase(repo, number)
-                print(f"  [{label}] behind by {behind_by}, rebasing")
+            if rebase_already_triggered(repo, author_login, details):
+                print(f"  [{label}] behind by {behind_by}, waiting for rebase")
             else:
-                print(f"  [{label}] behind by {behind_by}, waiting for dependabot")
+                trigger_rebase(repo, number, author_login, details["body"])
+                print(f"  [{label}] behind by {behind_by}, rebasing")
             details = wait_for_rebase(repo, number, label)
 
     ci_running, ci_passing = check_ci_status(details)
@@ -148,16 +171,18 @@ def process_pr(repo, pr, label_names, details):
 
 
 def process_repo(repo):
-    """Fetch and process all dependabot PRs for a single repo serially."""
-    output = run_gh([
-        "pr", "list",
-        "--repo", repo,
-        "--author", "app/dependabot",
-        "--state", "open",
-        "--json", "title,url,number,createdAt,labels,body",
-        "--limit", "100",
-    ])
-    prs = json.loads(output)
+    """Fetch and process all dependabot/renovate PRs for a single repo serially."""
+    prs = []
+    for author in ["app/dependabot", "app/renovate"]:
+        output = run_gh([
+            "pr", "list",
+            "--repo", repo,
+            "--author", author,
+            "--state", "open",
+            "--json", "title,url,number,createdAt,labels,body,author",
+            "--limit", "100",
+        ])
+        prs.extend(json.loads(output))
     if not prs:
         return
 
