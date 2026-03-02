@@ -28,7 +28,7 @@ def get_pr_details(repo, number):
     return json.loads(run_gh([
         "pr", "view", str(number),
         "--repo", repo,
-        "--json", "body,statusCheckRollup,mergeStateStatus",
+        "--json", "body,headRefOid,statusCheckRollup,comments,mergeStateStatus",
     ]))
 
 
@@ -137,7 +137,7 @@ def process_pr(repo, pr, label_names, details):
 
     author_login = pr["author"]["login"]
 
-    if is_currently_rebasing(pr["body"]):
+    if is_currently_rebasing(details["body"]):
         print(f"  [{label}] rebasing, waiting...")
         details = wait_for_rebase(repo, number, label)
     elif label_names & {"github_actions", "github-actions"}:
@@ -169,21 +169,14 @@ def process_repo(repo):
             "--repo", repo,
             "--author", author,
             "--state", "open",
-            "--json", "title,url,number,createdAt,labels,body,author,"
-                      "headRefOid,statusCheckRollup,comments,mergeStateStatus",
+            "--json", "number,labels,body,author",
             "--limit", "100",
         ])
         prs.extend(json.loads(output))
-    if not prs:
-        return
-
-    for pr in prs:
-        print(f"  #{pr['number']} [{repo}] {pr['title']}")
-        print(f"    {pr['url']}  (created: {pr['createdAt'][:10]})")
-
     for pr in prs:
         label_names = {label["name"] for label in pr["labels"]}
-        print(process_pr(repo, pr, label_names, pr))
+        details = get_pr_details(repo, pr["number"])
+        print(process_pr(repo, pr, label_names, details))
 
 
 def main():
