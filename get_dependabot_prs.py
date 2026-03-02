@@ -36,7 +36,7 @@ def get_repositories(organization="arlol"):
 def get_prs(repository):
     prs = []
     for author in ["app/dependabot", "app/renovate"]:
-        output = run_gh([
+        prs_output = run_gh([
             "pr", "list",
             "--repo", repository,
             "--author", author,
@@ -44,7 +44,7 @@ def get_prs(repository):
             "--json", "number,labels,body,author",
             "--limit", "100",
         ])
-        prs.extend(json.loads(output))
+        prs.extend(json.loads(prs_output))
     return prs
 
 
@@ -165,7 +165,8 @@ def process_pr(repository, pr):
     if is_currently_rebasing(pr_details):
         print(f"[{label}] rebasing, waiting...")
         pr_details = wait_for_rebase(repository, number, label)
-    elif label_names & {"github_actions", "github-actions"}:
+
+    if label_names & {"github_actions", "github-actions"}:
         if pr_details["mergeStateStatus"] == "BEHIND":
             if rebase_already_triggered(repository, author_login, pr_details):
                 print(f"[{label}] behind, waiting for rebase")
