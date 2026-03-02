@@ -28,16 +28,8 @@ def get_pr_details(repo, number):
     return json.loads(run_gh([
         "pr", "view", str(number),
         "--repo", repo,
-        "--json", "body,headRefOid,baseRefName,statusCheckRollup,comments",
+        "--json", "body,statusCheckRollup,mergeStateStatus",
     ]))
-
-
-def get_behind_by(repo, base, head):
-    compare = json.loads(run_gh([
-        "api", f"repos/{repo}/compare/{base}...{head}",
-        "--jq", "{behind_by: .behind_by}",
-    ]))
-    return compare["behind_by"]
 
 
 def get_head_commit_date(repo, head):
@@ -120,9 +112,8 @@ def wait_for_rebase(repo, number, label, poll_interval=15):
             print(f"  [{label}] rebasing, waiting {poll_interval}s...")
             time.sleep(poll_interval)
             continue
-        behind_by = get_behind_by(repo, details["baseRefName"], details["headRefOid"])
-        if behind_by > 0:
-            print(f"  [{label}] still behind by {behind_by}, waiting {poll_interval}s...")
+        if details["mergeStateStatus"] == "BEHIND":
+            print(f"  [{label}] still behind, waiting {poll_interval}s...")
             time.sleep(poll_interval)
             continue
         return details
@@ -150,13 +141,12 @@ def process_pr(repo, pr, label_names, details):
         print(f"  [{label}] rebasing, waiting...")
         details = wait_for_rebase(repo, number, label)
     elif label_names & {"github_actions", "github-actions"}:
-        behind_by = get_behind_by(repo, details["baseRefName"], details["headRefOid"])
-        if behind_by > 0:
+        if details["mergeStateStatus"] == "BEHIND":
             if rebase_already_triggered(repo, author_login, details):
-                print(f"  [{label}] behind by {behind_by}, waiting for rebase")
+                print(f"  [{label}] behind, waiting for rebase")
             else:
                 trigger_rebase(repo, number, author_login, details["body"])
-                print(f"  [{label}] behind by {behind_by}, rebasing")
+                print(f"  [{label}] behind, rebasing")
             details = wait_for_rebase(repo, number, label)
 
     ci_running, ci_passing = check_ci_status(details)
@@ -179,7 +169,8 @@ def process_repo(repo):
             "--repo", repo,
             "--author", author,
             "--state", "open",
-            "--json", "title,url,number,createdAt,labels,body,author",
+            "--json", "title,url,number,createdAt,labels,body,author,"
+                      "headRefOid,statusCheckRollup,comments,mergeStateStatus",
             "--limit", "100",
         ])
         prs.extend(json.loads(output))
@@ -192,8 +183,7 @@ def process_repo(repo):
 
     for pr in prs:
         label_names = {label["name"] for label in pr["labels"]}
-        details = get_pr_details(repo, pr["number"])
-        print(process_pr(repo, pr, label_names, details))
+        print(process_pr(repo, pr, label_names, pr))
 
 
 def main():
