@@ -1,6 +1,7 @@
-# github pr renovatebotdependabotbot
+# merge bot prs
 
-This just makes my life easier
+This just makes my life easier by going through my organization and merges all
+dependency updates the way I like it.
 
 # Quickstart
 
