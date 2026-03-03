@@ -5,7 +5,7 @@ This just makes my life easier
 # Quickstart
 
 ```
-uv run get_dependabot_prs.py
+uv run merge_bot_prs.py
 ```
 
 # What it does
