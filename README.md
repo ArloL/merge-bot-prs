@@ -10,7 +10,7 @@ uv run merge_bot_prs.py
 
 # What it does
 
-1. Lists all non-archived repositories in the `arlol` GitHub organization.
+1. Get all non-archived repositories in the `arlol` GitHub organization.
 2. For each repository (in parallel), fetches all open pull requests authored by `app/dependabot` or `app/renovate`.
 3. For each PR (serially per repo):
    - If a rebase is already in progress (dependabot body text or renovate's rebase checkbox is checked), waits until the rebase finishes and the PR is up to date.
