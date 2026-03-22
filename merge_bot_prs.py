@@ -4,9 +4,11 @@ Processes all open pull requests in the arlol organization made by dependabot
 or renovate, and tries to do the right thing to merge them.
 """
 
+import argparse
 import json
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -52,8 +54,16 @@ def get_pr_details(repository, number):
     return json.loads(run_gh([
         "pr", "view", str(number),
         "--repo", repository,
-        "--json", "body,headRefOid,statusCheckRollup,comments,mergeStateStatus",
+        "--json", "body,baseRefName,headRefOid,statusCheckRollup,comments,mergeStateStatus,state",
     ]))
+
+
+def is_behind(repository, pr_details):
+    behind_by = run_gh([
+        "api", f"repos/{repository}/compare/{pr_details['baseRefName']}...{pr_details['headRefOid']}",
+        "--jq", ".behind_by",
+    ]).strip()
+    return int(behind_by) > 0
 
 
 def get_head_commit_date(repository, head):
@@ -132,11 +142,14 @@ def wait_for_rebase(repository, number, label, poll_interval=15):
     Returns latest PR pr_details."""
     while True:
         pr_details = get_pr_details(repository, number)
+        if pr_details["state"] == "MERGED":
+            print(f"[{label}] merged while waiting for rebase")
+            return pr_details
         if is_currently_rebasing(pr_details):
             print(f"[{label}] rebasing, waiting {poll_interval}s...")
             time.sleep(poll_interval)
             continue
-        if pr_details["mergeStateStatus"] == "BEHIND":
+        if is_behind(repository, pr_details):
             print(f"[{label}] still behind, waiting {poll_interval}s...")
             time.sleep(poll_interval)
             continue
@@ -154,29 +167,50 @@ def wait_for_ci(repository, number, label, poll_interval=15):
         time.sleep(poll_interval)
 
 
-def process_pr(repository, pr):
+
+def process_pr(repository, pr, debug=False):
     label_names = {label["name"] for label in pr["labels"]}
     number = pr["number"]
     label = f"{repository}#{number}"
     author_login = pr["author"]["login"]
 
     pr_details = get_pr_details(repository, number)
+
+    if debug:
+        print(f"[{label}] mergeStateStatus={pr_details['mergeStateStatus']}")
+
     if is_currently_rebasing(pr_details):
         print(f"[{label}] rebasing, waiting...")
         pr_details = wait_for_rebase(repository, number, label)
 
+    if pr_details["state"] == "MERGED":
+        return
+
+    merge_state = pr_details["mergeStateStatus"]
+
+    if merge_state in {"BLOCKED", "DIRTY", "DRAFT"}:
+        print(f"[{label}] {merge_state}, skipping")
+        return
+
     if label_names & {"github_actions", "github-actions"}:
-        if pr_details["mergeStateStatus"] == "BEHIND":
+        behind = is_behind(repository, pr_details)
+        if debug:
+            print(f"[{label}] is_behind={behind}")
+        if behind:
             if rebase_already_triggered(repository, author_login, pr_details):
-                print(f"[{label}] behind, waiting for rebase")
+                print(f"[{label}] waiting for rebase")
             else:
                 trigger_rebase(repository, number, author_login, pr_details["body"])
-                print(f"[{label}] behind, rebasing")
+                print(f"[{label}] rebasing")
             pr_details = wait_for_rebase(repository, number, label)
+            if pr_details["state"] == "MERGED":
+                return
 
     ci_running, ci_passing = check_ci_status(pr_details)
+    if debug:
+        print(f"[{label}] ci_running={ci_running} ci_passing={ci_passing}")
     if ci_running:
-        ci_passing = wait_for_ci(repository)
+        ci_passing = wait_for_ci(repository, number, label)
 
     if ci_passing:
         merge_pr(repository, number)
@@ -185,16 +219,26 @@ def process_pr(repository, pr):
         print(f"[{label}] CI failed, skipping")
 
 
-def process_repository(repository):
+def process_repository(repository, debug=False, semaphore=None):
     for pr in get_prs(repository):
-        process_pr(repository, pr)
+        if semaphore is not None and not semaphore.acquire(blocking=False):
+            break
+        process_pr(repository, pr, debug=debug)
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--count", type=int)
+    args = parser.parse_args()
+
+    semaphore = threading.Semaphore(args.count) if args.count is not None else None
+
+    repositories = get_repositories()
+
     with ThreadPoolExecutor() as executor:
-        repositories = get_repositories()
         futures = {
-            executor.submit(process_repository, repository): repository
+            executor.submit(process_repository, repository, args.debug, semaphore): repository
             for repository in repositories
         }
         for future in as_completed(futures):

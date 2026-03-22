@@ -1,7 +1,4 @@
 [project]
-name = "get-dependabot-prs"
+name = "merge-bot-prs"
 version = "0.1.0"
 requires-python = ">=3.13"
-
-[project.scripts]
-get-dependabot-prs = "get_dependabot_prs:main"
