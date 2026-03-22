@@ -66,6 +66,10 @@ def is_behind(repository, pr_details):
     return int(behind_by) > 0
 
 
+def is_open(pr_details):
+    return pr_details["state"] == "OPEN"
+
+
 def get_head_commit_date(repository, head):
     return run_gh([
         "api", f"repos/{repository}/git/commits/{head}",
@@ -142,8 +146,8 @@ def wait_for_rebase(repository, number, label, poll_interval=15):
     Returns latest PR pr_details."""
     while True:
         pr_details = get_pr_details(repository, number)
-        if pr_details["state"] == "MERGED":
-            print(f"[{label}] merged while waiting for rebase")
+        if not is_open(pr_details):
+            print(f"[{label}] {pr_details['state']} while waiting for rebase")
             return pr_details
         if is_currently_rebasing(pr_details):
             print(f"[{label}] rebasing, waiting {poll_interval}s...")
@@ -160,8 +164,8 @@ def wait_for_ci(repository, number, label, poll_interval=15):
     """Polls PR CI status until all checks complete. Returns latest pr_details."""
     while True:
         pr_details = get_pr_details(repository, number)
-        if pr_details["state"] == "MERGED":
-            print(f"[{label}] merged while waiting for CI")
+        if not is_open(pr_details):
+            print(f"[{label}] {pr_details['state']} while waiting for CI")
             return pr_details
         ci_running, ci_passing = check_ci_status(pr_details)
         if not ci_running:
@@ -186,7 +190,7 @@ def process_pr(repository, pr, debug=False):
         print(f"[{label}] rebasing, waiting...")
         pr_details = wait_for_rebase(repository, number, label)
 
-    if pr_details["state"] == "MERGED":
+    if not is_open(pr_details):
         return
 
     merge_state = pr_details["mergeStateStatus"]
@@ -206,7 +210,7 @@ def process_pr(repository, pr, debug=False):
                 trigger_rebase(repository, number, author_login, pr_details["body"])
                 print(f"[{label}] rebasing")
             pr_details = wait_for_rebase(repository, number, label)
-            if pr_details["state"] == "MERGED":
+            if not is_open(pr_details):
                 return
 
     ci_running, ci_passing = check_ci_status(pr_details)
@@ -214,7 +218,7 @@ def process_pr(repository, pr, debug=False):
         print(f"[{label}] ci_running={ci_running} ci_passing={ci_passing}")
     if ci_running:
         pr_details = wait_for_ci(repository, number, label)
-        if pr_details["state"] == "MERGED":
+        if not is_open(pr_details):
             return
         _, ci_passing = check_ci_status(pr_details)
 
