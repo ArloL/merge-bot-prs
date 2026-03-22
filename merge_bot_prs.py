@@ -157,12 +157,15 @@ def wait_for_rebase(repository, number, label, poll_interval=15):
 
 
 def wait_for_ci(repository, number, label, poll_interval=15):
-    """Polls PR CI status until all checks complete. Returns ci_passing bool."""
+    """Polls PR CI status until all checks complete. Returns latest pr_details."""
     while True:
         pr_details = get_pr_details(repository, number)
+        if pr_details["state"] == "MERGED":
+            print(f"[{label}] merged while waiting for CI")
+            return pr_details
         ci_running, ci_passing = check_ci_status(pr_details)
         if not ci_running:
-            return ci_passing
+            return pr_details
         print(f"[{label}] CI still running, waiting {poll_interval}s...")
         time.sleep(poll_interval)
 
@@ -210,7 +213,10 @@ def process_pr(repository, pr, debug=False):
     if debug:
         print(f"[{label}] ci_running={ci_running} ci_passing={ci_passing}")
     if ci_running:
-        ci_passing = wait_for_ci(repository, number, label)
+        pr_details = wait_for_ci(repository, number, label)
+        if pr_details["state"] == "MERGED":
+            return
+        _, ci_passing = check_ci_status(pr_details)
 
     if ci_passing:
         merge_pr(repository, number)
