@@ -191,6 +191,7 @@ def process_pr(repository, pr, debug=False):
         pr_details = wait_for_rebase(repository, number, label)
 
     if not is_open(pr_details):
+        print(f"[{label}] {pr_details['state']} while waiting for CI")
         return
 
     merge_state = pr_details["mergeStateStatus"]
@@ -211,6 +212,7 @@ def process_pr(repository, pr, debug=False):
                 print(f"[{label}] rebasing")
             pr_details = wait_for_rebase(repository, number, label)
             if not is_open(pr_details):
+                print(f"[{label}] {pr_details['state']} while waiting for CI")
                 return
 
     ci_running, ci_passing = check_ci_status(pr_details)
@@ -219,6 +221,7 @@ def process_pr(repository, pr, debug=False):
     if ci_running:
         pr_details = wait_for_ci(repository, number, label)
         if not is_open(pr_details):
+            print(f"[{label}] {pr_details['state']} while waiting for CI")
             return
         _, ci_passing = check_ci_status(pr_details)
 
