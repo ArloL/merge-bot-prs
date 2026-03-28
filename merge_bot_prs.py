@@ -195,7 +195,7 @@ def process_pr(repository, pr, debug=False):
 
     merge_state = pr_details["mergeStateStatus"]
 
-    if merge_state in {"BLOCKED", "DIRTY", "DRAFT"}:
+    if merge_state in {"DIRTY", "DRAFT"}:
         print(f"[{label}] {merge_state}, skipping")
         return
 
