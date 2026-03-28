@@ -205,11 +205,6 @@ def rebase_when_behind(pr):
 
 
 def process_pr(pr, debug=False):
-    pr = get_pr(pr)
-
-    label_names = {label["name"] for label in pr["labels"]}
-    number = pr["number"]
-
     if debug:
         print(f"[{pr["label"]}] mergeStateStatus={pr['mergeStateStatus']}")
 
@@ -220,11 +215,11 @@ def process_pr(pr, debug=False):
             return
 
     merge_state = pr["mergeStateStatus"]
-
     if merge_state in {"DIRTY", "DRAFT"}:
         print(f"[{pr["label"]}] {merge_state}, skipping")
         return
 
+    label_names = {label["name"] for label in pr["labels"]}
     if label_names & {"github_actions", "github-actions"}:
         pr = rebase_when_behind(pr)
         if not is_open(pr):
@@ -254,7 +249,7 @@ def process_repository(repository, debug=False, semaphore=None):
     for pr in get_prs(repository):
         if semaphore is not None and not semaphore.acquire(blocking=False):
             break
-        process_pr(pr, debug=debug)
+        process_pr(get_pr(pr), debug=debug)
 
 
 def main():
