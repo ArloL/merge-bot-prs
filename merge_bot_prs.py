@@ -8,7 +8,6 @@ import argparse
 import json
 import subprocess
 import sys
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -24,33 +23,23 @@ def run_gh(args):
         sys.exit(1)
     return result.stdout
 
-def get_repositories(organization="arlol"):
-    repositories_output = run_gh([
-        "repo", "list", organization,
-        "--no-archived",
-        "--json", "nameWithOwner",
-        "--limit", "1000",
-    ])
-    repositories = [r["nameWithOwner"] for r in json.loads(repositories_output)]
-    return repositories
-
-
-def get_prs(repository):
+def get_all_prs(organization="arlol"):
     prs = []
     for author in ["app/dependabot", "app/renovate"]:
         prs_output = run_gh([
-            "pr", "list",
-            "--repo", repository,
+            "search", "prs",
+            "archived:false",
+            "--owner", organization,
             "--author", author,
             "--state", "open",
-            "--json", "number",
-            "--limit", "100",
+            "--json", "number,repository",
+            "--limit", "1000",
         ])
         prs.extend(json.loads(prs_output))
     return [{
-        **pr,
-        "repository": repository,
-        "label": f"[{repository}#{pr["number"]}]"
+        "number": pr["number"],
+        "repository": pr["repository"]["nameWithOwner"],
+        "label": f"[{pr['repository']['nameWithOwner']}#{pr['number']}]",
     } for pr in prs]
 
 
@@ -245,10 +234,8 @@ def process_pr(pr, debug=False):
         print(f"{pr["label"]} merged")
 
 
-def process_repository(repository, debug=False, semaphore=None):
-    for pr in get_prs(repository):
-        if semaphore is not None and not semaphore.acquire(blocking=False):
-            break
+def process_repository(prs, debug=False):
+    for pr in prs:
         process_pr(get_pr(pr), debug=debug)
 
 
@@ -258,17 +245,31 @@ def main():
     parser.add_argument("--count", type=int)
     args = parser.parse_args()
 
-    semaphore = threading.Semaphore(args.count) if args.count is not None else None
+    processed = set()
+    while True:
+        all_prs = [
+            pr for pr in get_all_prs()
+            if (pr["repository"], pr["number"]) not in processed
+        ]
+        if args.count is not None:
+            all_prs = all_prs[:args.count]
 
-    repositories = get_repositories()
+        if not all_prs:
+            break
 
-    with ThreadPoolExecutor() as executor:
-        futures = {
-            executor.submit(process_repository, repository, args.debug, semaphore): repository
-            for repository in repositories
-        }
-        for future in as_completed(futures):
-            future.result()  # re-raise exceptions
+        processed.update((pr["repository"], pr["number"]) for pr in all_prs)
+
+        prs_by_repo = {}
+        for pr in all_prs:
+            prs_by_repo.setdefault(pr["repository"], []).append(pr)
+
+        with ThreadPoolExecutor() as executor:
+            futures = {
+                executor.submit(process_repository, prs, args.debug): repository
+                for repository, prs in prs_by_repo.items()
+            }
+            for future in as_completed(futures):
+                future.result()  # re-raise exceptions
 
 
 if __name__ == "__main__":
