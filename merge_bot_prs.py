@@ -154,6 +154,21 @@ def wait_for_rebase(pr, poll_interval=15):
         return pr
 
 
+def wait_for_clean(pr, poll_interval=15):
+    while True:
+        pr = get_pr(pr)
+        if not is_open(pr):
+            return pr
+        merge_state = pr["mergeStateStatus"]
+        if merge_state in {"CLEAN", "HAS_HOOKS"}:
+            return pr
+        if merge_state in {"DIRTY", "DRAFT"}:
+            print(f"{pr['label']} {merge_state} while waiting for clean, skipping")
+            return pr
+        print(f"{pr['label']} {merge_state}, waiting {poll_interval}s...")
+        time.sleep(poll_interval)
+
+
 def wait_for_ci(pr, poll_interval=15):
     while True:
         pr = get_pr(pr)
@@ -230,6 +245,12 @@ def process_pr(pr, debug=False):
         _, ci_passing = check_ci_status(pr)
 
     if ci_passing:
+        pr = wait_for_clean(pr)
+        if not is_open(pr):
+            return
+        if pr["mergeStateStatus"] not in {"CLEAN", "HAS_HOOKS"}:
+            print(f"{pr['label']} {pr['mergeStateStatus']}, skipping")
+            return
         merge_pr(pr)
         print(f"{pr["label"]} merged")
 
