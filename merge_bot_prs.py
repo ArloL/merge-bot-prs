@@ -197,13 +197,13 @@ def rebase_when_behind(pr, debug=False):
         pr = wait_for_rebase(pr)
 
         if not is_open(pr):
-            return
+            return pr
 
         ci_running, ci_passing = check_ci_status(pr)
         if ci_running:
             pr = wait_for_ci(pr)
             if not is_open(pr):
-                return
+                return pr
 
     return pr
 
