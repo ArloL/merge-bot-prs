@@ -23,7 +23,7 @@ Per-PR logic (`process_pr`):
 - If the PR has a `github_actions`/`github-actions` label and is behind the base branch, trigger a rebase and wait for it to complete.
 - Wait for all CI checks to complete.
 - If CI failed, attempt a rebase (in case the failure was due to being out of date) and re-check.
-- If CI passed, wait for `mergeStateStatus` to become `CLEAN` or `HAS_HOOKS` (handles rulesets like code scanning that finish after CI), then merge with `--rebase`.
+- If CI passed, wait for `mergeStateStatus` to become `CLEAN` or `HAS_HOOKS` (handles rulesets like code scanning that finish after CI), then merge with `--rebase`. While waiting, if the PR is stuck `BLOCKED` but CodeQL has been green for ≥120s, re-run CodeQL once to work around GitHub's stale code-scanning bug (see below).
 
 Poll interval for all wait loops is 15 seconds.
 
@@ -33,6 +33,7 @@ Poll interval for all wait loops is 15 seconds.
 - **Rebase detection differs by bot**: dependabot is triggered via `@dependabot rebase` comment; renovate via checking `- [x] <!-- rebase-check -->` in the PR body.
 - **`is_behind` uses the compare API** directly (`repos/{repo}/compare/{base}...{head}`) rather than trusting `mergeStateStatus`, because `mergeStateStatus` is unreliable when branch protection rules are absent.
 - **`run_gh` calls `sys.exit(1)` on any error** — a single unexpected failure will terminate the whole process.
+- **Stale CodeQL workaround** (`wait_for_clean` + `codeql_settled`/`codeql_run_ids`/`rerun_codeql`): GitHub sometimes leaves a PR `BLOCKED` forever even though the CodeQL workflow ran and the `CodeQL` status check is green — the `code_scanning` ruleset never registers the results. When the PR is `BLOCKED` and every CodeQL-related check (`"codeql"` in `workflowName`/`name`) has been `COMPLETED`/`SUCCESS` for ≥120s, the CodeQL Analysis workflow run (id parsed from the check `detailsUrl`) is re-run **once** via `gh run rerun`, which re-uploads SARIF and unsticks the rule. If it stays `BLOCKED` after that, the PR is skipped and retried on the next pass. `rerun_codeql` uses `check=False` so a non-re-runnable (e.g. expired) run doesn't terminate the process.
 
 ## mergeStateStatus values
 
