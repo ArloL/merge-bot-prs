@@ -50,7 +50,7 @@ def get_pr(pr):
     result = json.loads(run_gh([
         "pr", "view", str(pr["number"]),
         "--repo", pr["repository"],
-        "--json", "author,baseRefName,body,comments,headRefOid,labels,mergeStateStatus,number,state,statusCheckRollup",
+        "--json", "author,baseRefName,body,headRefOid,labels,mergeStateStatus,number,state,statusCheckRollup",
     ], label=pr["label"]))
     result["repository"] = pr["repository"]
     result["label"] = pr["label"]
@@ -69,11 +69,8 @@ def is_open(pr):
     return pr["state"] == "OPEN"
 
 
-def get_head_commit_date(pr):
-    return run_gh([
-        "api", f"repos/{pr["repository"]}/git/commits/{pr["headRefOid"]}",
-        "--jq", ".committer.date",
-    ], label=pr["label"]).strip()
+def is_dependabot(pr):
+    return "dependabot" in pr["author"]["login"]
 
 
 def is_currently_rebasing(pr):
@@ -129,34 +126,35 @@ def rerun_codeql(pr, run_ids):
                label=pr["label"], check=False)
 
 
+def update_branch(pr):
+    """Rebase the branch onto its base via GitHub, bypassing the bot entirely.
+
+    Returns True if the branch was moved.
+    """
+    result = subprocess.run(
+        ["gh", "pr", "update-branch", str(pr["number"]),
+         "--repo", pr["repository"], "--rebase"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(f"{pr['label']} update-branch failed: {result.stderr.strip()}",
+              file=sys.stderr)
+        return False
+    return True
+
+
 def rebase_already_triggered(pr):
-    """Returns True if a rebase has already been requested and we should wait."""
-    if "dependabot" in pr["author"]["login"]:
-        last_rebase_comment = next((
-            comment for comment in reversed(pr["comments"])
-            if "@dependabot rebase" in comment["body"]
-        ), None)
-        if not last_rebase_comment:
-            return False
-        head_commit_date = get_head_commit_date(pr)
-        return head_commit_date <= last_rebase_comment["createdAt"]
-    else:
-        return "- [x] <!-- rebase-check -->" in pr["body"]
+    """Returns True if renovate has already been asked to rebase and we should wait."""
+    return "- [x] <!-- rebase-check -->" in pr["body"]
 
 
 def trigger_rebase(pr):
-    if "dependabot" in pr["author"]["login"]:
-        run_gh([
-            "pr", "comment", str(pr["number"]),
-            "--repo", pr["repository"],
-            "--body", "@dependabot rebase",
-        ], label=pr["label"])
-    else:
-        new_body = pr["body"].replace(
-            "- [ ] <!-- rebase-check -->",
-            "- [x] <!-- rebase-check -->",
-        )
-        run_gh(["pr", "edit", str(pr["number"]), "--repo", pr["repository"], "--body", new_body], label=pr["label"])
+    new_body = pr["body"].replace(
+        "- [ ] <!-- rebase-check -->",
+        "- [x] <!-- rebase-check -->",
+    )
+    run_gh(["pr", "edit", str(pr["number"]), "--repo", pr["repository"], "--body", new_body], label=pr["label"])
 
 
 def print_merge_diagnostics(pr):
@@ -241,11 +239,14 @@ def wait_for_rebase(pr, poll_interval=15):
             print(f"{pr["label"]} {pr['state']} while waiting for rebase")
             return pr
         if is_currently_rebasing(pr):
-            print(f"{pr["label"]} rebasing, waiting {poll_interval}s...")
+            print(f"{pr['label']} rebasing, waiting {poll_interval}s...")
             time.sleep(poll_interval)
             continue
-        if is_behind(pr):
-            print(f"{pr["label"]} still behind, waiting {poll_interval}s...")
+        # Only renovate is expected to close the gap on its own; a dependabot
+        # branch that is still behind is handled by update_branch, and waiting
+        # on it here would spin forever.
+        if not is_dependabot(pr) and is_behind(pr):
+            print(f"{pr['label']} still behind, waiting {poll_interval}s...")
             time.sleep(poll_interval)
             continue
         return pr
@@ -300,29 +301,35 @@ def wait_for_ci(pr, poll_interval=15):
         return pr
 
 
-def rebase_when_behind(pr, debug=False):
+def rebase_when_behind(pr, debug=False, poll_interval=15):
     behind = is_behind(pr)
     if debug:
-        print(f"{pr["label"]} is_behind={behind}")
-    if behind:
+        print(f"{pr['label']} is_behind={behind}")
+    if not behind:
+        return pr
+
+    if is_dependabot(pr):
+        # `@dependabot rebase` is useless here: dependabot only rebases when the
+        # files it manages would change, so a PR sitting behind on unrelated
+        # commits gets "already up-to-date" and never moves. Rebase it ourselves.
+        if not update_branch(pr):
+            return pr
+        print(f"{pr['label']} branch updated")
+        # The rollup for the new head is empty until GitHub registers the
+        # workflows, and an empty rollup reads as "CI passed".
+        time.sleep(poll_interval)
+    else:
         if rebase_already_triggered(pr):
-            print(f"{pr["label"]} waiting for rebase")
+            print(f"{pr['label']} waiting for rebase")
         else:
             trigger_rebase(pr)
-            print(f"{pr["label"]} rebasing")
+            print(f"{pr['label']} rebasing")
 
         pr = wait_for_rebase(pr)
-
         if not is_open(pr):
             return pr
 
-        ci_running, ci_passing = check_ci_status(pr)
-        if ci_running:
-            pr = wait_for_ci(pr)
-            if not is_open(pr):
-                return pr
-
-    return pr
+    return wait_for_ci(pr)
 
 
 def process_pr(pr, debug=False):
