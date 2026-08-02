@@ -27,6 +27,14 @@ Per-PR logic (`process_pr`):
 
 Poll interval for all wait loops is 15 seconds.
 
+## Output
+
+Every line is `HH:MM:SS [repo#pr] message`, written through a lock and flushed immediately — repos are processed in parallel, so the timestamp is what makes an interleaved log readable afterwards.
+
+`process_pr` returns an outcome for **every** exit path, logged as `outcome=<x> in <n>s`, and the run ends with a tally plus a list of everything that did not merge. Outcomes: `merged`, `ci-failed`, `dirty`, `draft`, `merged`/`closed` (resolved elsewhere mid-run), `not-mergeable-<state>`, `rule-eval-timeout`.
+
+Useful detail that is on by default: the failing check names behind `ci_passing=False`, the pending check names while waiting on CI, `old -> new` head SHAs after `update_branch`, and attempt counters on the bounded wait loops. `--debug` adds per-PR author/labels/check-count, `ahead`/`behind` counts, and a per-repo breakdown of what the search found.
+
 ## Key design decisions
 
 - **`mergeStateStatus` is checked before merging** — not just CI. GitHub rulesets (e.g. required code scanning) can keep a PR `BLOCKED` even after all CI checks pass. The `wait_for_clean` function polls until the status is mergeable.

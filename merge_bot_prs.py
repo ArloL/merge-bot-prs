@@ -10,9 +10,22 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+
+# Repos are processed in parallel, so lines from different PRs interleave.
+# The timestamp is what makes the resulting log readable after the fact, and
+# the lock keeps concurrent writes from splicing into each other.
+_log_lock = threading.Lock()
+
+
+def log(label, message, stream=sys.stdout):
+    with _log_lock:
+        print(f"{datetime.now().astimezone():%H:%M:%S} {label} {message}",
+              file=stream, flush=True)
 
 
 def run_gh(args, label="", check=True):
@@ -22,11 +35,11 @@ def run_gh(args, label="", check=True):
         text=True,
     )
     if check and result.returncode != 0:
-        print(f"{label} Error: {result.stderr.strip()}", file=sys.stderr)
+        log(label, f"Error: {result.stderr.strip()}", stream=sys.stderr)
         sys.exit(1)
     return result.stdout
 
-def get_all_prs(organization="arlol"):
+def get_all_prs(organization="arlol", debug=False):
     prs = []
     for author in ["app/dependabot", "app/renovate"]:
         prs_output = run_gh([
@@ -38,12 +51,22 @@ def get_all_prs(organization="arlol"):
             "--json", "number,repository",
             "--limit", "1000",
         ])
-        prs.extend(json.loads(prs_output))
-    return [{
+        found = json.loads(prs_output)
+        # archived:false is deliberate — archived repos are read-only, so their
+        # PRs can be neither merged nor closed. Say so, otherwise the PRs they
+        # hide look like PRs the script silently forgot.
+        log("[search]", f"{author}: {len(found)} open PRs (archived repos excluded)")
+        prs.extend(found)
+    result = [{
         "number": pr["number"],
         "repository": pr["repository"]["nameWithOwner"],
         "label": f"[{pr['repository']['nameWithOwner']}#{pr['number']}]",
     } for pr in prs]
+    if debug:
+        by_repo = Counter(pr["repository"] for pr in result)
+        for repository, count in sorted(by_repo.items()):
+            log("[search]", f"  {repository}: {count}")
+    return result
 
 
 def get_pr(pr):
@@ -57,12 +80,17 @@ def get_pr(pr):
     return result
 
 
-def is_behind(pr):
-    behind_by = run_gh([
+def compare_counts(pr):
+    """(ahead_by, behind_by) of the head against the base branch."""
+    counts = run_gh([
         "api", f"repos/{pr["repository"]}/compare/{pr['baseRefName']}...{pr['headRefOid']}",
-        "--jq", ".behind_by",
-    ], label=pr["label"]).strip()
-    return int(behind_by) > 0
+        "--jq", "[.ahead_by, .behind_by] | @tsv",
+    ], label=pr["label"]).split()
+    return int(counts[0]), int(counts[1])
+
+
+def is_behind(pr):
+    return compare_counts(pr)[1] > 0
 
 
 def is_open(pr):
@@ -138,9 +166,12 @@ def update_branch(pr):
         text=True,
     )
     if result.returncode != 0:
-        print(f"{pr['label']} update-branch failed: {result.stderr.strip()}",
-              file=sys.stderr)
+        log(pr["label"], f"update-branch failed: {result.stderr.strip()}",
+            stream=sys.stderr)
         return False
+    old_head = pr["headRefOid"]
+    new_head = get_pr(pr)["headRefOid"]
+    log(pr["label"], f"branch updated {old_head[:8]} -> {new_head[:8]}")
     return True
 
 
@@ -161,27 +192,30 @@ def print_merge_diagnostics(pr):
     """Print why GitHub is refusing to merge: fresh merge state, required
     checks, and the branch protection / ruleset that governs the base branch."""
     fresh = get_pr(pr)
-    print(f"{pr['label']} diagnostics: mergeStateStatus={fresh['mergeStateStatus']} state={fresh['state']}")
+    ahead, behind = compare_counts(fresh)
+    log(pr["label"], f"diagnostics: mergeStateStatus={fresh['mergeStateStatus']} "
+                     f"state={fresh['state']} head={fresh['headRefOid'][:8]} "
+                     f"base={fresh['baseRefName']} ahead={ahead} behind={behind}")
     for check in fresh["statusCheckRollup"]:
-        name = check.get("name") or check.get("context") or check.get("__typename", "?")
         status = check.get("status") or check.get("state")
         conclusion = check.get("conclusion")
         required = check.get("isRequired")
-        print(f"{pr['label']} diagnostics: check {name}: status={status} conclusion={conclusion} required={required}")
+        log(pr["label"], f"diagnostics: check {check_name(check)}: status={status} "
+                         f"conclusion={conclusion} required={required}")
 
     # Classic branch protection (404 when only rulesets are configured).
     protection = run_gh([
         "api", f"repos/{pr['repository']}/branches/{fresh['baseRefName']}/protection",
     ], label=pr["label"], check=False).strip()
     if protection:
-        print(f"{pr['label']} diagnostics: branch protection: {protection}")
+        log(pr["label"], f"diagnostics: branch protection: {protection}")
 
     # Rulesets that apply to the base branch (the modern equivalent).
     rules = run_gh([
         "api", f"repos/{pr['repository']}/rules/branches/{fresh['baseRefName']}",
     ], label=pr["label"], check=False).strip()
     if rules:
-        print(f"{pr['label']} diagnostics: active rules: {rules}")
+        log(pr["label"], f"diagnostics: active rules: {rules}")
 
 
 def merge_pr(pr, poll_interval=15, max_attempts=20, debug=False):
@@ -189,13 +223,15 @@ def merge_pr(pr, poll_interval=15, max_attempts=20, debug=False):
 
     Returns True on merge, False if rule evaluation never settles in time.
     """
-    for _ in range(max_attempts):
+    for attempt in range(1, max_attempts + 1):
         result = subprocess.run(
             ["gh", "pr", "merge", str(pr["number"]), "--repo", pr["repository"], "--rebase"],
             capture_output=True,
             text=True,
         )
         if result.returncode == 0:
+            if attempt > 1:
+                log(pr["label"], f"merge succeeded on attempt {attempt}")
             return True
         # Both errors mean GitHub is still evaluating async rules (e.g. code
         # scanning) that briefly reported the PR as CLEAN. Keep polling.
@@ -204,51 +240,84 @@ def merge_pr(pr, poll_interval=15, max_attempts=20, debug=False):
             or "the base branch policy prohibits the merge" in result.stderr
         )
         if not retryable:
-            print(f"{pr['label']} Error: {result.stderr.strip()}", file=sys.stderr)
+            log(pr["label"], f"Error: {result.stderr.strip()}", stream=sys.stderr)
             if debug:
                 print_merge_diagnostics(pr)
             sys.exit(1)
-        print(f"{pr['label']} rule evaluation pending, waiting {poll_interval}s...")
+        log(pr["label"], f"rule evaluation pending, waiting {poll_interval}s "
+                         f"(attempt {attempt}/{max_attempts}): {result.stderr.strip()}")
         time.sleep(poll_interval)
     return False
 
 
+PASSING_CONCLUSIONS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
+
+
+def check_name(check):
+    return check.get("name") or check.get("context") or check.get("__typename", "?")
+
+
+def check_passing(check):
+    if "status" in check:
+        return check["conclusion"] in PASSING_CONCLUSIONS
+    return check.get("state") == "SUCCESS"
+
+
+def failing_checks(pr):
+    """`name=conclusion` for every check that is not passing.
+
+    Without this a PR just reports ci_passing=False and you have to open it in a
+    browser to find out which job broke.
+    """
+    return [
+        f"{check_name(c)}={c.get('conclusion') or c.get('state')}"
+        for c in pr["statusCheckRollup"]
+        if not check_passing(c)
+    ]
+
+
+def pending_checks(pr):
+    """Names of checks that have not finished yet."""
+    return [
+        check_name(c)
+        for c in pr["statusCheckRollup"]
+        if (c.get("status", "COMPLETED") != "COMPLETED"
+            if "status" in c
+            else c.get("state") in {"EXPECTED", "PENDING"})
+    ]
+
+
 def check_ci_status(pr):
     """Returns (ci_running, ci_passing) tuple."""
-    passing_conclusions = {"SUCCESS", "NEUTRAL", "SKIPPED"}
     checks = pr["statusCheckRollup"]
-    ci_running = any(
-        check.get("status", "COMPLETED") != "COMPLETED"
-        if "status" in check
-        else check.get("state") in {"EXPECTED", "PENDING"}
-        for check in checks
-    )
-    ci_passing = all(
-        check["conclusion"] in passing_conclusions
-        if "status" in check
-        else check.get("state") == "SUCCESS"
-        for check in checks
-    )
+    ci_running = bool(pending_checks(pr))
+    ci_passing = all(check_passing(check) for check in checks)
     return ci_running, ci_passing
 
 
 def wait_for_rebase(pr, poll_interval=15):
+    waited = 0
     while True:
         pr = get_pr(pr)
         if not is_open(pr):
-            print(f"{pr["label"]} {pr['state']} while waiting for rebase")
+            log(pr["label"], f"{pr['state']} while waiting for rebase")
             return pr
         if is_currently_rebasing(pr):
-            print(f"{pr['label']} rebasing, waiting {poll_interval}s...")
+            log(pr["label"], f"rebasing, waiting {poll_interval}s (waited {waited}s)...")
             time.sleep(poll_interval)
+            waited += poll_interval
             continue
         # Only renovate is expected to close the gap on its own; a dependabot
         # branch that is still behind is handled by update_branch, and waiting
         # on it here would spin forever.
-        if not is_dependabot(pr) and is_behind(pr):
-            print(f"{pr['label']} still behind, waiting {poll_interval}s...")
-            time.sleep(poll_interval)
-            continue
+        if not is_dependabot(pr):
+            ahead, behind = compare_counts(pr)
+            if behind:
+                log(pr["label"], f"still behind by {behind} (ahead {ahead}), "
+                                 f"waiting {poll_interval}s (waited {waited}s)...")
+                time.sleep(poll_interval)
+                waited += poll_interval
+                continue
         return pr
 
 
@@ -263,7 +332,7 @@ def wait_for_clean(pr, poll_interval=15, max_attempts=20, stale_codeql_seconds=1
         if merge_state in {"CLEAN", "HAS_HOOKS"}:
             return pr
         if merge_state in {"DIRTY", "DRAFT"}:
-            print(f"{pr['label']} {merge_state} while waiting for clean, skipping")
+            log(pr["label"], f"{merge_state} while waiting for clean, skipping")
             return pr
         if (
             merge_state == "BLOCKED"
@@ -271,8 +340,8 @@ def wait_for_clean(pr, poll_interval=15, max_attempts=20, stale_codeql_seconds=1
             and codeql_settled(pr, stale_codeql_seconds)
         ):
             run_ids = codeql_run_ids(pr)
-            print(f"{pr['label']} BLOCKED with CodeQL green >{stale_codeql_seconds}s, "
-                  f"re-running CodeQL runs {sorted(run_ids)}")
+            log(pr["label"], f"BLOCKED with CodeQL green >{stale_codeql_seconds}s, "
+                             f"re-running CodeQL runs {sorted(run_ids)}")
             rerun_codeql(pr, run_ids)
             reran_codeql = True
             time.sleep(poll_interval)     # let GitHub re-queue the jobs
@@ -281,30 +350,39 @@ def wait_for_clean(pr, poll_interval=15, max_attempts=20, stale_codeql_seconds=1
                 return pr
             attempts = 0                  # fresh budget for re-registration
             continue
-        print(f"{pr['label']} {merge_state}, waiting {poll_interval}s...")
+        log(pr["label"], f"{merge_state}, waiting {poll_interval}s "
+                         f"(attempt {attempts + 1}/{max_attempts})...")
         time.sleep(poll_interval)
         attempts += 1
+    log(pr["label"], f"gave up waiting for a mergeable state after "
+                     f"{max_attempts} attempts, last state {pr['mergeStateStatus']}")
     return pr
 
 
 def wait_for_ci(pr, poll_interval=15):
+    waited = 0
     while True:
         pr = get_pr(pr)
         if not is_open(pr):
-            print(f"{pr["label"]} {pr['state']} while waiting for CI")
+            log(pr["label"], f"{pr['state']} while waiting for CI")
             return pr
-        ci_running, _ = check_ci_status(pr)
-        if ci_running:
-            print(f"{pr["label"]} CI still running, waiting {poll_interval}s...")
+        pending = pending_checks(pr)
+        if pending:
+            log(pr["label"], f"CI still running, waiting {poll_interval}s "
+                             f"(waited {waited}s, pending: {', '.join(sorted(pending))})...")
             time.sleep(poll_interval)
+            waited += poll_interval
             continue
+        if waited:
+            log(pr["label"], f"CI finished after {waited}s")
         return pr
 
 
 def rebase_when_behind(pr, debug=False, poll_interval=15):
-    behind = is_behind(pr)
+    ahead, behind = compare_counts(pr)
     if debug:
-        print(f"{pr['label']} is_behind={behind}")
+        log(pr["label"], f"ahead={ahead} behind={behind} base={pr['baseRefName']} "
+                         f"head={pr['headRefOid'][:8]}")
     if not behind:
         return pr
 
@@ -312,18 +390,18 @@ def rebase_when_behind(pr, debug=False, poll_interval=15):
         # `@dependabot rebase` is useless here: dependabot only rebases when the
         # files it manages would change, so a PR sitting behind on unrelated
         # commits gets "already up-to-date" and never moves. Rebase it ourselves.
+        log(pr["label"], f"behind by {behind}, rebasing via update-branch")
         if not update_branch(pr):
             return pr
-        print(f"{pr['label']} branch updated")
         # The rollup for the new head is empty until GitHub registers the
         # workflows, and an empty rollup reads as "CI passed".
         time.sleep(poll_interval)
     else:
         if rebase_already_triggered(pr):
-            print(f"{pr['label']} waiting for rebase")
+            log(pr["label"], f"behind by {behind}, rebase already requested, waiting")
         else:
             trigger_rebase(pr)
-            print(f"{pr['label']} rebasing")
+            log(pr["label"], f"behind by {behind}, requested rebase via rebase-check box")
 
         pr = wait_for_rebase(pr)
         if not is_open(pr):
@@ -333,57 +411,76 @@ def rebase_when_behind(pr, debug=False, poll_interval=15):
 
 
 def process_pr(pr, debug=False):
+    """Drive one PR as far as it will go. Returns a short outcome string.
+
+    Every exit path returns one, so that no PR can disappear from the run
+    without the log saying what became of it.
+    """
     if debug:
-        print(f"{pr["label"]} mergeStateStatus={pr['mergeStateStatus']}")
+        log(pr["label"], f"mergeStateStatus={pr['mergeStateStatus']} "
+                         f"author={pr['author']['login']} "
+                         f"labels={sorted(l['name'] for l in pr['labels'])} "
+                         f"checks={len(pr['statusCheckRollup'])}")
 
     if is_currently_rebasing(pr):
-        print(f"{pr["label"]} rebasing, waiting...")
+        log(pr["label"], "bot is rebasing, waiting...")
         pr = wait_for_rebase(pr)
         if not is_open(pr):
-            return
+            return pr["state"].lower()
 
     merge_state = pr["mergeStateStatus"]
     if merge_state in {"DIRTY", "DRAFT"}:
-        print(f"{pr["label"]} {merge_state}, skipping")
-        return
+        return merge_state.lower()
 
     label_names = {label["name"] for label in pr["labels"]}
     if label_names & {"github_actions", "github-actions"}:
         pr = rebase_when_behind(pr, debug)
         if not is_open(pr):
-            return
+            return pr["state"].lower()
 
     ci_running, ci_passing = check_ci_status(pr)
     if debug:
-        print(f"{pr["label"]} ci_running={ci_running} ci_passing={ci_passing}")
+        log(pr["label"], f"ci_running={ci_running} ci_passing={ci_passing}")
     if ci_running:
         pr = wait_for_ci(pr)
         if not is_open(pr):
-            return
+            return pr["state"].lower()
         _, ci_passing = check_ci_status(pr)
 
     if not ci_passing:
+        log(pr["label"], f"CI failing: {', '.join(failing_checks(pr)) or 'unknown'}")
         pr = rebase_when_behind(pr, debug)
         if not is_open(pr):
-            return
+            return pr["state"].lower()
         _, ci_passing = check_ci_status(pr)
 
-    if ci_passing:
-        pr = wait_for_clean(pr)
-        if not is_open(pr):
-            return
-        if pr["mergeStateStatus"] not in {"CLEAN", "HAS_HOOKS"}:
-            print(f"{pr['label']} {pr['mergeStateStatus']}, skipping")
-            return
-        if merge_pr(pr, debug=debug):
-            print(f"{pr['label']} merged")
-        else:
-            print(f"{pr['label']} rule evaluation never settled, skipping")
+    if not ci_passing:
+        # Previously this fell off the end of the function in silence, so a PR
+        # with genuinely red CI looked identical to one that was never seen.
+        log(pr["label"], f"CI still failing after rebase check: "
+                         f"{', '.join(failing_checks(pr)) or 'unknown'}")
+        return "ci-failed"
+
+    pr = wait_for_clean(pr)
+    if not is_open(pr):
+        return pr["state"].lower()
+    if pr["mergeStateStatus"] not in {"CLEAN", "HAS_HOOKS"}:
+        return f"not-mergeable-{pr['mergeStateStatus'].lower()}"
+    if merge_pr(pr, debug=debug):
+        return "merged"
+    return "rule-eval-timeout"
 
 
 def process_repository(prs, debug=False):
+    """Returns [(label, outcome, seconds)] for every PR in this repository."""
+    results = []
     for pr in prs:
-        process_pr(get_pr(pr), debug=debug)
+        started = time.monotonic()
+        outcome = process_pr(get_pr(pr), debug=debug)
+        elapsed = round(time.monotonic() - started)
+        log(pr["label"], f"outcome={outcome} in {elapsed}s")
+        results.append((pr["label"], outcome, elapsed))
+    return results
 
 
 def main():
@@ -392,10 +489,13 @@ def main():
     parser.add_argument("--count", type=int)
     args = parser.parse_args()
 
+    started = time.monotonic()
     processed = set()
+    results = []
+    passes = 0
     while True:
         all_prs = [
-            pr for pr in get_all_prs()
+            pr for pr in get_all_prs(debug=args.debug)
             if (pr["repository"], pr["number"]) not in processed
         ]
         if args.count is not None:
@@ -410,13 +510,27 @@ def main():
         for pr in all_prs:
             prs_by_repo.setdefault(pr["repository"], []).append(pr)
 
+        passes += 1
+        log("[run]", f"pass {passes}: {len(all_prs)} PRs across "
+                     f"{len(prs_by_repo)} repos, processing repos in parallel")
+
         with ThreadPoolExecutor() as executor:
             futures = {
                 executor.submit(process_repository, prs, args.debug): repository
                 for repository, prs in prs_by_repo.items()
             }
             for future in as_completed(futures):
-                future.result()  # re-raise exceptions
+                results.extend(future.result())  # re-raise exceptions
+
+    # The per-PR lines are interleaved across threads, so end with a flat
+    # account of what happened to everything.
+    log("[run]", f"done: {len(results)} PRs in {passes} pass(es), "
+                 f"{round(time.monotonic() - started)}s total")
+    for outcome, count in Counter(o for _, o, _ in results).most_common():
+        log("[run]", f"  {outcome}: {count}")
+    unmerged = [(label, o, s) for label, o, s in results if o != "merged"]
+    for label, outcome, elapsed in sorted(unmerged):
+        log("[run]", f"  {label} {outcome} ({elapsed}s)")
 
 
 if __name__ == "__main__":
