@@ -5,6 +5,7 @@ or renovate, and tries to do the right thing to merge them.
 """
 
 import argparse
+import functools
 import json
 import os
 import re
@@ -40,9 +41,35 @@ def run_gh(args, label="", check=True):
         sys.exit(1)
     return result.stdout
 
+
+def paginated(endpoint, label=""):
+    """Every element of a paginated array endpoint, as dicts.
+
+    `--paginate` prints one JSON array per page, which json.loads cannot read,
+    and `--slurp` (which would merge them) is rejected alongside `--jq`. Asking
+    jq for `.[]` sidesteps both: one compact object per line, pages included.
+    """
+    output = run_gh(["api", "--paginate", endpoint, "--jq", ".[]"], label=label)
+    return [json.loads(line) for line in output.splitlines() if line]
+
+
+@functools.cache
+def gh_login():
+    """The account gh is authenticated as."""
+    return run_gh(["api", "user", "--jq", ".login"]).strip()
+
+
+# The two APIs spell the same two accounts differently: `gh pr view --json
+# author` reports the app slug, the REST commits API reports the bot user.
+DEPENDABOT_AUTHOR = "app/dependabot"
+BOT_AUTHORS = (DEPENDABOT_AUTHOR, "app/renovate")
+BOT_COMMIT_LOGINS = ("dependabot[bot]", "renovate[bot]")
+BOT_BRANCH_PREFIXES = ("dependabot/", "renovate/")
+
+
 def get_all_prs(organization="arlol", debug=False):
     prs = []
-    for author in ["app/dependabot", "app/renovate"]:
+    for author in BOT_AUTHORS:
         prs_output = run_gh([
             "search", "prs",
             "archived:false",
@@ -74,7 +101,9 @@ def get_pr(pr):
     result = json.loads(run_gh([
         "pr", "view", str(pr["number"]),
         "--repo", pr["repository"],
-        "--json", "author,baseRefName,body,headRefOid,labels,mergeStateStatus,number,state,statusCheckRollup",
+        "--json", ("author,baseRefName,body,headRefName,headRefOid,headRepositoryOwner,"
+                   "isCrossRepository,labels,mergeStateStatus,number,reviewDecision,state,"
+                   "statusCheckRollup"),
     ], label=pr["label"]))
     result["repository"] = pr["repository"]
     result["label"] = pr["label"]
@@ -99,7 +128,9 @@ def is_open(pr):
 
 
 def is_dependabot(pr):
-    return "dependabot" in pr["author"]["login"]
+    # Exact, not a substring: `"dependabot" in login` would also accept a human
+    # account called something like dependabot-helper.
+    return pr["author"]["login"] == DEPENDABOT_AUTHOR
 
 
 def is_currently_rebasing(pr):
@@ -190,6 +221,101 @@ def trigger_rebase(pr):
     run_gh(["pr", "edit", str(pr["number"]), "--repo", pr["repository"], "--body", new_body], label=pr["label"])
 
 
+WORKFLOW_DIR = ".github/workflows/"
+USES_LINE = re.compile(r"^[+-]\s*(?:-\s*)?uses:\s")
+
+
+def commit_provenance_problem(pr):
+    """Reason the commits are not provably the bots', or None.
+
+    A pushed commit can claim any author email, and GitHub resolves
+    `author.login` from that email — so the login on its own is forgeable by
+    anyone with write access to the repository. What cannot be forged is the
+    signature: commits the bots create through the API are signed by GitHub's
+    web-flow key. The one legitimate unsigned case is our own update_branch,
+    which re-creates the commit with the running user as committer.
+    """
+    commits = paginated(
+        f"repos/{pr['repository']}/pulls/{pr['number']}/commits?per_page=100",
+        pr["label"],
+    )
+    if not commits:
+        log(pr["label"], "refusing: no commits")
+        return "no-commits"
+    for commit in commits:
+        sha = commit["sha"][:8]
+        author = (commit.get("author") or {}).get("login")
+        committer = (commit.get("committer") or {}).get("login")
+        if author not in BOT_COMMIT_LOGINS:
+            log(pr["label"], f"refusing: commit {sha} authored by {author or '?'}")
+            return "foreign-commit"
+        if not commit["commit"]["verification"]["verified"] and committer != gh_login():
+            log(pr["label"], f"refusing: commit {sha} is unsigned and was committed "
+                             f"by {committer or '?'}, not {gh_login()}")
+            return "unsigned-commit"
+    return None
+
+
+def workflow_diff_problem(pr):
+    """Reason a workflow file change is not a plain action bump, or None.
+
+    A same-repo pull request runs the workflows from its own branch with the
+    repository's secrets, so a workflow edit is the most valuable thing to slip
+    into a bot PR. Genuine bumps only ever move `uses:` lines.
+    """
+    files = paginated(
+        f"repos/{pr['repository']}/pulls/{pr['number']}/files?per_page=100",
+        pr["label"],
+    )
+    for file in files:
+        if not file["filename"].startswith(WORKFLOW_DIR):
+            continue
+        patch = file.get("patch")
+        if patch is None:
+            # No patch means the file was renamed or the diff was too large to
+            # inline. Either way we cannot see what changed, so we refuse.
+            log(pr["label"], f"refusing: no diff available for {file['filename']} "
+                             f"({file.get('status')})")
+            return "workflow-diff-unavailable"
+        for line in patch.splitlines():
+            if line.startswith(("+++", "---")) or not line.startswith(("+", "-")):
+                continue
+            if not USES_LINE.match(line):
+                log(pr["label"], f"refusing: {file['filename']} changes more than "
+                                 f"uses: lines: {line.strip()}")
+                return "workflow-edited"
+    return None
+
+
+def verify_pr(pr):
+    """Reason to refuse this PR, or None if it is safe to merge.
+
+    Runs immediately before the merge, so that everything it inspects belongs
+    to pr["headRefOid"] — which merge_pr then pins with --match-head-commit.
+    """
+    author = pr["author"]["login"]
+    if author not in BOT_AUTHORS:
+        log(pr["label"], f"refusing: author is {author}")
+        return "foreign-author"
+    if pr["isCrossRepository"]:
+        owner = (pr["headRepositoryOwner"] or {}).get("login", "?")
+        log(pr["label"], f"refusing: head branch lives in a fork owned by {owner}")
+        return "cross-repository"
+    if not pr["headRefName"].startswith(BOT_BRANCH_PREFIXES):
+        log(pr["label"], f"refusing: unexpected head branch {pr['headRefName']}")
+        return "foreign-branch"
+    if pr["reviewDecision"] == "CHANGES_REQUESTED":
+        log(pr["label"], "refusing: a review requested changes")
+        return "changes-requested"
+    if not pr["statusCheckRollup"]:
+        # check_ci_status calls all() over the rollup, so an empty one reads as
+        # "CI passed". Without this a PR whose checks never ran would sail
+        # through the CI gate on its way here.
+        log(pr["label"], "refusing: no status checks ran at all")
+        return "no-checks"
+    return commit_provenance_problem(pr) or workflow_diff_problem(pr)
+
+
 def print_merge_diagnostics(pr):
     """Print why GitHub is refusing to merge: fresh merge state, required
     checks, and the branch protection / ruleset that governs the base branch."""
@@ -223,11 +349,17 @@ def print_merge_diagnostics(pr):
 def merge_pr(pr, poll_interval=15, max_attempts=20, debug=False):
     """Attempt merge, retrying while GitHub re-evaluates rules asynchronously.
 
-    Returns True on merge, False if rule evaluation never settles in time.
+    Returns the outcome: "merged", "head-changed" if something landed on the
+    branch after verify_pr vouched for it, or "rule-eval-timeout" if rule
+    evaluation never settles in time.
     """
     for attempt in range(1, max_attempts + 1):
         result = subprocess.run(
-            ["gh", "pr", "merge", str(pr["number"]), "--repo", pr["repository"], "--rebase"],
+            # --match-head-commit binds the merge to the head verify_pr
+            # inspected, so a commit that lands while we wait out the rule
+            # evaluation below cannot ride in on that verification.
+            ["gh", "pr", "merge", str(pr["number"]), "--repo", pr["repository"], "--rebase",
+             "--match-head-commit", pr["headRefOid"]],
             capture_output=True,
             text=True,
             check=False,
@@ -235,7 +367,13 @@ def merge_pr(pr, poll_interval=15, max_attempts=20, debug=False):
         if result.returncode == 0:
             if attempt > 1:
                 log(pr["label"], f"merge succeeded on attempt {attempt}")
-            return True
+            return "merged"
+        if "Head branch was modified" in result.stderr:
+            # Retrying would only re-check the same stale SHA. Leave it for the
+            # next run, which will verify whatever is on the branch by then.
+            log(pr["label"], f"head moved away from {pr['headRefOid'][:8]} while "
+                             f"merging, refusing")
+            return "head-changed"
         # Both errors mean GitHub is still evaluating async rules (e.g. code
         # scanning) that briefly reported the PR as CLEAN. Keep polling.
         retryable = (
@@ -250,7 +388,7 @@ def merge_pr(pr, poll_interval=15, max_attempts=20, debug=False):
         log(pr["label"], f"rule evaluation pending, waiting {poll_interval}s "
                          f"(attempt {attempt}/{max_attempts}): {result.stderr.strip()}")
         time.sleep(poll_interval)
-    return False
+    return "rule-eval-timeout"
 
 
 PASSING_CONCLUSIONS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
@@ -469,9 +607,10 @@ def process_pr(pr, debug=False):
         return pr["state"].lower()
     if pr["mergeStateStatus"] not in {"CLEAN", "HAS_HOOKS"}:
         return f"not-mergeable-{pr['mergeStateStatus'].lower()}"
-    if merge_pr(pr, debug=debug):
-        return "merged"
-    return "rule-eval-timeout"
+    refusal = verify_pr(pr)
+    if refusal:
+        return f"unsafe-{refusal}"
+    return merge_pr(pr, debug=debug)
 
 
 def process_repository(prs, debug=False):

@@ -23,7 +23,8 @@ Per-PR logic (`process_pr`):
 - If the PR has a `github_actions`/`github-actions` label and is behind the base branch, bring the branch up to date (see below — dependabot is rebased directly, renovate is asked to rebase itself).
 - Wait for all CI checks to complete.
 - If CI failed, attempt a rebase (in case the failure was due to being out of date) and re-check.
-- If CI passed, wait for `mergeStateStatus` to become `CLEAN` or `HAS_HOOKS` (handles rulesets like code scanning that finish after CI), then merge with `--rebase`. While waiting, if the PR is stuck `BLOCKED` but CodeQL has been green for ≥120s, re-run CodeQL once to work around GitHub's stale code-scanning bug (see below).
+- If CI passed, wait for `mergeStateStatus` to become `CLEAN` or `HAS_HOOKS` (handles rulesets like code scanning that finish after CI). While waiting, if the PR is stuck `BLOCKED` but CodeQL has been green for ≥120s, re-run CodeQL once to work around GitHub's stale code-scanning bug (see below).
+- Run `verify_pr` (see Provenance checks below) and merge with `--rebase` only if it returns nothing.
 
 Poll interval for all wait loops is 15 seconds.
 
@@ -31,7 +32,9 @@ Poll interval for all wait loops is 15 seconds.
 
 Every line is `HH:MM:SS [repo#pr] message`, written through a lock and flushed immediately — repos are processed in parallel, so the timestamp is what makes an interleaved log readable afterwards.
 
-`process_pr` returns an outcome for **every** exit path, logged as `outcome=<x> in <n>s`, and the run ends with a tally plus a list of everything that did not merge. Outcomes: `merged`, `ci-failed`, `dirty`, `draft`, `merged`/`closed` (resolved elsewhere mid-run), `not-mergeable-<state>`, `rule-eval-timeout`.
+`process_pr` returns an outcome for **every** exit path, logged as `outcome=<x> in <n>s`, and the run ends with a tally plus a list of everything that did not merge. Outcomes: `merged`, `ci-failed`, `dirty`, `draft`, `merged`/`closed` (resolved elsewhere mid-run), `not-mergeable-<state>`, `rule-eval-timeout`, `head-changed`, and `unsafe-<reason>` for each provenance refusal.
+
+Refusal reasons are deliberately short kebab-case strings so the end-of-run `Counter` tally stays readable; the specifics (which commit, which file, which line) go out as a `refusing: ...` log line at the moment of refusal.
 
 Useful detail that is on by default: the failing check names behind `ci_passing=False`, the pending check names while waiting on CI, `old -> new` head SHAs after `update_branch`, and attempt counters on the bounded wait loops. `--debug` adds per-PR author/labels/check-count, `ahead`/`behind` counts, and a per-repo breakdown of what the search found.
 
@@ -45,6 +48,18 @@ Useful detail that is on by default: the failing check names behind `ci_passing=
 - **`is_behind` uses the compare API** directly (`repos/{repo}/compare/{base}...{head}`) rather than trusting `mergeStateStatus`, because `mergeStateStatus` is unreliable when branch protection rules are absent.
 - **`run_gh` calls `sys.exit(1)` on any error** — a single unexpected failure will terminate the whole process.
 - **Stale CodeQL workaround** (`wait_for_clean` + `codeql_settled`/`codeql_run_ids`/`rerun_codeql`): GitHub sometimes leaves a PR `BLOCKED` forever even though the CodeQL workflow ran and the `CodeQL` status check is green — the `code_scanning` ruleset never registers the results. When the PR is `BLOCKED` and every CodeQL-related check (`"codeql"` in `workflowName`/`name`) has been `COMPLETED`/`SUCCESS` for ≥120s, the CodeQL Analysis workflow run (id parsed from the check `detailsUrl`) is re-run **once** via `gh run rerun`, which re-uploads SARIF and unsticks the rule. If it stays `BLOCKED` after that, the PR is skipped and retried on the next pass. `rerun_codeql` uses `check=False` so a non-re-runnable (e.g. expired) run doesn't terminate the process.
+
+## Provenance checks
+
+`verify_pr` runs immediately before the merge and refuses anything it cannot vouch for. It is deliberately narrow: it guards against someone with write access pushing to a bot branch, not against a compromised dependency itself.
+
+- **`gh` reports bot logins two different ways.** `gh pr view --json author` gives the app slug (`app/dependabot`), the REST commits API gives the bot user (`dependabot[bot]`). Hence the separate `BOT_AUTHORS` and `BOT_COMMIT_LOGINS`. Getting this wrong is quiet: `is_dependabot` silently sends every dependabot PR down the renovate path.
+- **The commit author login is forgeable; the signature is not.** Anyone with write access can push a commit with dependabot's author email, and GitHub resolves `author.login` from that email. So `commit_provenance_problem` requires each commit to be *both* authored by a bot *and* signed (`verification.verified`), because genuine bot commits are created through the API and signed by GitHub's web-flow key.
+- **`update_branch` is the one legitimate unsigned commit.** Rebasing via `gh pr update-branch` re-creates the commit with the running user as committer and no signature — so an unsigned commit is accepted only when its committer is `gh_login()`. This exception is why the check cannot simply be `verified == true`; a sweep of 80 merged bot PRs found exactly one commit in this shape, and it was ours.
+- **Workflow diffs may only move `uses:` lines** (`workflow_diff_problem`). A same-repo PR runs the workflows from its own branch with the repository's secrets, making a workflow edit the highest-value thing to smuggle into a bot PR. Every changed line in `.github/workflows/**` across 25 sampled merged PRs was a `uses:` line, so this costs nothing in false positives. A workflow file with no `patch` in the API response (renamed, or diff too large to inline) is refused rather than skipped.
+- **Changed file paths are otherwise not allowlisted.** Real bot PRs in this org touch `.rb` Homebrew formulae, `pyproject.toml`, `Dockerfile.noarg`, lockfiles and more; an allowlist would be a maintenance treadmill with a high false-positive rate. The strictness budget is spent on workflows instead.
+- **An empty `statusCheckRollup` is refused** (`no-checks`). `check_ci_status` calls `all()` over the rollup, so no checks reads as "CI passed" — every repo in the org currently reports 9+ checks, so this only fires on something genuinely wrong.
+- **`merge_pr` pins `--match-head-commit`** to the head `verify_pr` inspected. `wait_for_clean` and the merge retry loop can each burn five minutes, and without the pin a commit landing in that window would inherit the earlier verification. A mismatch reports `head-changed` and is left for the next run; the error is matched on `"Head branch was modified"`, distinct from the transient `"Base branch was modified"` flake. If GitHub ever reworded it, the unrecognised-error path is `sys.exit(1)` — noisy, but still fail-closed.
 
 ## mergeStateStatus values
 

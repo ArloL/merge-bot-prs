@@ -16,10 +16,11 @@ uv run merge_bot_prs.py
 3. For each PR (serially per repo):
    - If a rebase is already in progress (dependabot body text or renovate's rebase checkbox is checked), waits until the rebase finishes and the PR is up to date.
    - If the PR has the `github_actions` or `github-actions` label and is behind the base branch:
-     - For dependabot: posts an `@dependabot rebase` comment (unless one was already posted after the last commit, in which case just waits).
+     - For dependabot: rebases the branch directly with `gh pr update-branch --rebase` (asking dependabot to rebase itself does not work when the PR is only behind on unrelated commits).
      - For renovate: checks the rebase checkbox in the PR body (unless already checked, in which case just waits).
      - Polls every 15 seconds until the PR is no longer rebasing and is up to date.
    - Once the PR is up to date, checks CI status:
      - If CI is still running, polls every 15 seconds until all checks complete.
-     - If CI passed (success, neutral, or skipped), merges the PR with rebase strategy.
      - If CI failed, skips the PR.
+   - Before merging, checks that the PR really is the bot's work: every commit authored by the bot and signed by GitHub, the branch not a fork, no workflow file changed beyond its `uses:` lines, and at least one status check actually ran. Anything else is skipped and reported rather than merged.
+   - Merges with rebase strategy, pinned to the exact commit that was verified.
