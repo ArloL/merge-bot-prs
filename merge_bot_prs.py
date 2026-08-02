@@ -14,7 +14,7 @@ import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 # Repos are processed in parallel, so lines from different PRs interleave.
 # The timestamp is what makes the resulting log readable after the fact, and
@@ -30,9 +30,10 @@ def log(label, message, stream=sys.stdout):
 
 def run_gh(args, label="", check=True):
     result = subprocess.run(
-        ["gh"] + args,
+        ["gh", *args],
         capture_output=True,
         text=True,
+        check=False,     # the caller's `check` decides, via the branch below
     )
     if check and result.returncode != 0:
         log(label, f"Error: {result.stderr.strip()}", stream=sys.stderr)
@@ -120,7 +121,7 @@ def codeql_settled(pr, min_age_seconds=120):
     codeql_checks = [c for c in pr["statusCheckRollup"] if _is_codeql_check(c)]
     if not codeql_checks:
         return False
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     passing = {"SUCCESS", "NEUTRAL", "SKIPPED"}
     for c in codeql_checks:
         if c.get("status") != "COMPLETED" or c.get("conclusion") not in passing:
@@ -128,7 +129,7 @@ def codeql_settled(pr, min_age_seconds=120):
         completed_at = c.get("completedAt")
         if not completed_at:
             return False
-        age = (now - datetime.fromisoformat(completed_at.replace("Z", "+00:00"))).total_seconds()
+        age = (now - datetime.fromisoformat(completed_at)).total_seconds()
         if age < min_age_seconds:
             return False
     return True
@@ -164,6 +165,7 @@ def update_branch(pr):
          "--repo", pr["repository"], "--rebase"],
         capture_output=True,
         text=True,
+        check=False,
     )
     if result.returncode != 0:
         log(pr["label"], f"update-branch failed: {result.stderr.strip()}",
@@ -228,6 +230,7 @@ def merge_pr(pr, poll_interval=15, max_attempts=20, debug=False):
             ["gh", "pr", "merge", str(pr["number"]), "--repo", pr["repository"], "--rebase"],
             capture_output=True,
             text=True,
+            check=False,
         )
         if result.returncode == 0:
             if attempt > 1:
