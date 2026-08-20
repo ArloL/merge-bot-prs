@@ -29,17 +29,48 @@ def log(label, message, stream=sys.stdout):
               file=stream, flush=True)
 
 
-def run_gh(args, label="", check=True):
-    result = subprocess.run(
-        ["gh", *args],
-        capture_output=True,
-        text=True,
-        check=False,     # the caller's `check` decides, via the branch below
-    )
-    if check and result.returncode != 0:
-        log(label, f"Error: {result.stderr.strip()}", stream=sys.stderr)
-        sys.exit(1)
-    return result.stdout
+# Blips talking to api.github.com, not answers about the PR. Matched on the
+# message because gh exits 1 for these exactly as it does for a real failure,
+# and retrying a genuine error (no such PR, no permission) would only stall.
+TRANSIENT_GH_ERRORS = (
+    "error connecting to",
+    "connection reset by peer",
+    "i/o timeout",
+    "tls handshake timeout",
+    "unexpected eof",
+    "http 502",
+    "http 503",
+    "http 504",
+)
+
+
+def is_transient_gh_error(stderr):
+    lowered = stderr.lower()
+    return any(signature in lowered for signature in TRANSIENT_GH_ERRORS)
+
+
+def run_gh(args, label="", check=True, retries=3, backoff=2):
+    for attempt in range(retries + 1):
+        result = subprocess.run(
+            ["gh", *args],
+            capture_output=True,
+            text=True,
+            check=False,     # the caller's `check` decides, via the branch below
+        )
+        if result.returncode == 0:
+            return result.stdout
+        # Worth retrying even when check=False: the caller gets stdout either
+        # way, so without this a blip silently reads as an empty response.
+        if attempt < retries and is_transient_gh_error(result.stderr):
+            delay = backoff * 2 ** attempt
+            log(label, f"transient gh error, retrying in {delay}s "
+                       f"(attempt {attempt + 1}/{retries}): {result.stderr.strip()}")
+            time.sleep(delay)
+            continue
+        if check:
+            log(label, f"Error: {result.stderr.strip()}", stream=sys.stderr)
+            sys.exit(1)
+        return result.stdout
 
 
 def paginated(endpoint, label=""):
