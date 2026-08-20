@@ -275,6 +275,34 @@ def trigger_rebase(pr):
     run_gh(["pr", "edit", str(pr["number"]), "--repo", pr["repository"], "--body", new_body], label=pr["label"])
 
 
+def request_branch_regeneration(pr):
+    """Ask the bot to rebuild the branch against the current base.
+
+    Not the same as bringing a behind branch up to date. GitHub refuses the
+    rebase when the PR and its base have both moved the same file -- a lockfile
+    bump replayed onto a base whose lockfile has since changed -- and under
+    required_linear_history a merge is not an alternative. Only the bot can
+    resolve that, by regenerating the lockfile against the new base.
+
+    Returns whether a request was made. Deliberately does not wait: the bot
+    takes minutes, and the next run verifies whatever lands from scratch.
+    """
+    if is_dependabot(pr):
+        # recreate, not rebase: rebase replays the same conflicting commit.
+        # Untested against a live dependabot PR -- every stuck PR observed so
+        # far has been renovate's.
+        run_gh(["pr", "comment", str(pr["number"]), "--repo", pr["repository"],
+                "--body", "@dependabot recreate"], label=pr["label"])
+        log(pr["label"], "asked dependabot to recreate the branch")
+        return True
+    if rebase_already_triggered(pr):
+        log(pr["label"], "rebase already requested, leaving for the next run")
+        return False
+    trigger_rebase(pr)
+    log(pr["label"], "asked renovate to regenerate the branch")
+    return True
+
+
 WORKFLOW_DIR = ".github/workflows/"
 USES_LINE = re.compile(r"^[+-]\s*(?:-\s*)?uses:\s")
 # Bots bump toolchain pins inside workflows too -- node-version: 22 and
@@ -705,7 +733,12 @@ def process_pr(pr, debug=False):
     refusal = verify_pr(pr)
     if refusal:
         return f"unsafe-{refusal}"
-    return merge_pr(pr, debug=debug)
+    outcome = merge_pr(pr, debug=debug)
+    if outcome == "not-rebasable" and request_branch_regeneration(pr):
+        # Otherwise this PR is refused identically on every future run while
+        # falling further behind -- the worst thing to accumulate unsupervised.
+        return "not-rebasable-regenerating"
+    return outcome
 
 
 def process_repository(prs, debug=False):
