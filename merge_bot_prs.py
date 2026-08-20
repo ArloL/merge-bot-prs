@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
@@ -44,6 +45,16 @@ TRANSIENT_GH_ERRORS = (
 )
 
 
+class GhError(Exception):
+    """A gh call failed in a way we cannot interpret.
+
+    Raised rather than exited: sys.exit inside a ThreadPoolExecutor worker
+    raises SystemExit in that thread alone, which silently drops the rest of
+    the repository's PRs and, once main reaches future.result(), suppresses the
+    end-of-run tally. An unsupervised run has nobody watching the console.
+    """
+
+
 def is_transient_gh_error(stderr):
     lowered = stderr.lower()
     return any(signature in lowered for signature in TRANSIENT_GH_ERRORS)
@@ -69,7 +80,7 @@ def run_gh(args, label="", check=True, retries=3, backoff=2):
             continue
         if check:
             log(label, f"Error: {result.stderr.strip()}", stream=sys.stderr)
-            sys.exit(1)
+            raise GhError(result.stderr.strip())
         return result.stdout
 
 
@@ -266,6 +277,15 @@ def trigger_rebase(pr):
 
 WORKFLOW_DIR = ".github/workflows/"
 USES_LINE = re.compile(r"^[+-]\s*(?:-\s*)?uses:\s")
+# Bots bump toolchain pins inside workflows too -- node-version: 22 and
+# friends. Refusing those was a live false positive on a renovate PR. The value
+# charset deliberately excludes $ { } and quotes mid-value, so an expression
+# like ${{ secrets.X }} still fails to match and is still refused.
+VERSION_PIN_LINE = re.compile(
+    r"^[+-]\s*(?:-\s*)?[a-z0-9_-]*version:\s*['\"]?[\w.+*-]+['\"]?\s*$",
+    re.IGNORECASE,
+)
+ALLOWED_WORKFLOW_LINES = (USES_LINE, VERSION_PIN_LINE)
 
 
 def commit_provenance_problem(pr):
@@ -304,7 +324,7 @@ def workflow_diff_problem(pr):
 
     A same-repo pull request runs the workflows from its own branch with the
     repository's secrets, so a workflow edit is the most valuable thing to slip
-    into a bot PR. Genuine bumps only ever move `uses:` lines.
+    into a bot PR. Genuine bumps only ever move `uses:` lines or version pins.
     """
     files = paginated(
         f"repos/{pr['repository']}/pulls/{pr['number']}/files?per_page=100",
@@ -323,9 +343,9 @@ def workflow_diff_problem(pr):
         for line in patch.splitlines():
             if line.startswith(("+++", "---")) or not line.startswith(("+", "-")):
                 continue
-            if not USES_LINE.match(line):
+            if not any(allowed.match(line) for allowed in ALLOWED_WORKFLOW_LINES):
                 log(pr["label"], f"refusing: {file['filename']} changes more than "
-                                 f"uses: lines: {line.strip()}")
+                                 f"uses: lines and version pins: {line.strip()}")
                 return "workflow-edited"
     return None
 
@@ -389,6 +409,13 @@ def print_merge_diagnostics(pr):
         log(pr["label"], f"diagnostics: active rules: {rules}")
 
 
+# Refusals that describe the pull request rather than a failure of ours. Each
+# gets its own outcome so an unsupervised run reports it and moves on.
+MERGE_REFUSALS = {
+    "This branch can't be rebased": "not-rebasable",
+}
+
+
 def merge_pr(pr, poll_interval=15, max_attempts=20, debug=False,
              stale_codeql_seconds=60):
     """Attempt merge, retrying while GitHub re-evaluates rules asynchronously.
@@ -428,10 +455,14 @@ def merge_pr(pr, poll_interval=15, max_attempts=20, debug=False,
             or "the base branch policy prohibits the merge" in result.stderr
         )
         if not retryable:
+            for message, outcome in MERGE_REFUSALS.items():
+                if message in result.stderr:
+                    log(pr["label"], f"{outcome}: {result.stderr.strip()}")
+                    return outcome
             log(pr["label"], f"Error: {result.stderr.strip()}", stream=sys.stderr)
             if debug:
                 print_merge_diagnostics(pr)
-            sys.exit(1)
+            raise GhError(result.stderr.strip())
         log(pr["label"], f"rule evaluation pending, waiting {poll_interval}s "
                          f"(attempt {attempt}/{max_attempts}): {result.stderr.strip()}")
         # This, not BLOCKED in wait_for_clean, is where the stale code-scanning
@@ -682,7 +713,15 @@ def process_repository(prs, debug=False):
     results = []
     for pr in prs:
         started = time.monotonic()
-        outcome = process_pr(get_pr(pr), debug=debug)
+        try:
+            outcome = process_pr(get_pr(pr), debug=debug)
+        except GhError as error:
+            outcome = "error-gh"
+            log(pr["label"], f"giving up on this PR: {error}")
+        except Exception:  # noqa: BLE001 - the point is that nothing escapes
+            outcome = "error-unexpected"
+            log(pr["label"], f"unexpected error:\n{traceback.format_exc().strip()}",
+                stream=sys.stderr)
         elapsed = round(time.monotonic() - started)
         log(pr["label"], f"outcome={outcome} in {elapsed}s")
         results.append((pr["label"], outcome, elapsed))
@@ -737,10 +776,15 @@ def main():
     unmerged = [(label, o, s) for label, o, s in results if o != "merged"]
     for label, outcome, elapsed in sorted(unmerged):
         log("[run]", f"  {label} {outcome} ({elapsed}s)")
+    return any(outcome.startswith("error-") for _, outcome, _ in results)
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(1 if main() else 0)
+    except GhError:
+        # Raised outside the worker threads (the PR search, gh_login). Already
+        # logged; a traceback would add nothing.
+        sys.exit(1)
     except KeyboardInterrupt:
         os._exit(130)
