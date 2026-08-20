@@ -143,9 +143,9 @@ def get_pr(pr):
     result = json.loads(run_gh([
         "pr", "view", str(pr["number"]),
         "--repo", pr["repository"],
-        "--json", ("author,baseRefName,body,headRefName,headRefOid,headRepositoryOwner,"
-                   "isCrossRepository,labels,mergeStateStatus,number,reviewDecision,state,"
-                   "statusCheckRollup"),
+        "--json", ("author,baseRefName,body,comments,headRefName,headRefOid,"
+                   "headRepositoryOwner,isCrossRepository,labels,mergeStateStatus,number,"
+                   "reviewDecision,state,statusCheckRollup"),
     ], label=pr["label"]))
     result["repository"] = pr["repository"]
     result["label"] = pr["label"]
@@ -275,6 +275,21 @@ def trigger_rebase(pr):
     run_gh(["pr", "edit", str(pr["number"]), "--repo", pr["repository"], "--body", new_body], label=pr["label"])
 
 
+DEPENDABOT_RECREATE = "@dependabot recreate"
+
+
+def recreate_already_requested(pr):
+    """True if our last word on this PR was already a recreate request.
+
+    Dependabot answers the comments it acts on, so an unanswered request means
+    it has not reached this one yet. Without this the script would re-comment
+    on every run -- #322 already carries two dead `@dependabot rebase` comments
+    from doing exactly that by hand.
+    """
+    comments = pr.get("comments") or []
+    return bool(comments) and DEPENDABOT_RECREATE in comments[-1]["body"]
+
+
 def request_branch_regeneration(pr):
     """Ask the bot to rebuild the branch against the current base.
 
@@ -288,11 +303,13 @@ def request_branch_regeneration(pr):
     takes minutes, and the next run verifies whatever lands from scratch.
     """
     if is_dependabot(pr):
-        # recreate, not rebase: rebase replays the same conflicting commit.
-        # Untested against a live dependabot PR -- every stuck PR observed so
-        # far has been renovate's.
+        # recreate, not rebase: rebase replays the same conflicting commit, and
+        # dependabot refuses outright when the files it manages are unchanged.
+        if recreate_already_requested(pr):
+            log(pr["label"], "recreate already requested, leaving for the next run")
+            return False
         run_gh(["pr", "comment", str(pr["number"]), "--repo", pr["repository"],
-                "--body", "@dependabot recreate"], label=pr["label"])
+                "--body", DEPENDABOT_RECREATE], label=pr["label"])
         log(pr["label"], "asked dependabot to recreate the branch")
         return True
     if rebase_already_triggered(pr):
@@ -693,6 +710,11 @@ def process_pr(pr, debug=False):
             return pr["state"].lower()
 
     merge_state = pr["mergeStateStatus"]
+    if merge_state == "DIRTY" and request_branch_regeneration(pr):
+        # Same failure shape as not-rebasable: only the bot can resolve the
+        # conflict, and skipping leaves the PR to rot. #322 sat DIRTY for 19
+        # days being skipped once per run.
+        return "dirty-regenerating"
     if merge_state in {"DIRTY", "DRAFT"}:
         return merge_state.lower()
 
