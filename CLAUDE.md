@@ -2,6 +2,21 @@
 
 Script that auto-merges all open dependabot/renovate PRs across the `arlol` GitHub organization.
 
+## Archived repositories are out of scope — always filter them out
+
+**Any query for "remaining" or "stuck" bot PRs must exclude archived repositories, or the answer will be wrong.** An archived repo is read-only: its PRs can never be merged, by anyone, and no tooling can change that. `get_all_prs` already excludes them, so they never appear in a run.
+
+They are also not accumulating. Those repos stopped receiving new PRs when they were archived; what is left is old and frozen. Nothing needs to be done about it, and reporting the raw count as a problem is a false alarm.
+
+The trap is that `gh search prs` does **not** filter them:
+
+```
+gh search prs --owner ArloL --state open --author app/dependabot    # includes archived repos
+gh api repos/ArloL/<repo> --jq .archived                            # check before counting
+```
+
+Measured 2026-08-20, right after a run that merged everything mergeable: 37 open bot PRs org-wide, of which **35 were in 8 archived repos**. Taking that number at face value would suggest the script had failed, when in fact only 2 PRs were in scope and both were correctly refused for real reasons.
+
 ## Running
 
 ```
