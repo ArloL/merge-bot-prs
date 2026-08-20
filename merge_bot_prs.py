@@ -186,6 +186,18 @@ def rerun_codeql(pr, run_ids):
                label=pr["label"], check=False)
 
 
+def rerun_stale_codeql(pr, min_age_seconds):
+    """Re-run CodeQL if every CodeQL check has been green for min_age_seconds.
+    Returns True if a re-run was kicked off."""
+    if not codeql_settled(pr, min_age_seconds):
+        return False
+    run_ids = codeql_run_ids(pr)
+    log(pr["label"], f"CodeQL green >{min_age_seconds}s but code scanning still "
+                     f"blocking, re-running runs {sorted(run_ids)}")
+    rerun_codeql(pr, run_ids)
+    return True
+
+
 def update_branch(pr):
     """Rebase the branch onto its base via GitHub, bypassing the bot entirely.
 
@@ -346,14 +358,18 @@ def print_merge_diagnostics(pr):
         log(pr["label"], f"diagnostics: active rules: {rules}")
 
 
-def merge_pr(pr, poll_interval=15, max_attempts=20, debug=False):
+def merge_pr(pr, poll_interval=15, max_attempts=20, debug=False,
+             stale_codeql_seconds=60):
     """Attempt merge, retrying while GitHub re-evaluates rules asynchronously.
 
     Returns the outcome: "merged", "head-changed" if something landed on the
     branch after verify_pr vouched for it, or "rule-eval-timeout" if rule
     evaluation never settles in time.
     """
-    for attempt in range(1, max_attempts + 1):
+    reran_codeql = False
+    attempt = 0
+    while attempt < max_attempts:
+        attempt += 1
         result = subprocess.run(
             # --match-head-commit binds the merge to the head verify_pr
             # inspected, so a commit that lands while we wait out the rule
@@ -387,6 +403,27 @@ def merge_pr(pr, poll_interval=15, max_attempts=20, debug=False):
             sys.exit(1)
         log(pr["label"], f"rule evaluation pending, waiting {poll_interval}s "
                          f"(attempt {attempt}/{max_attempts}): {result.stderr.strip()}")
+        # This, not BLOCKED in wait_for_clean, is where the stale code-scanning
+        # bug actually surfaces: mergeStateStatus reads CLEAN and only the merge
+        # call reports that code scanning is still waiting on a CodeQL run that
+        # finished long ago. Without a re-run here the loop just burns its whole
+        # budget and reports rule-eval-timeout.
+        if not reran_codeql:
+            fresh = get_pr(pr)
+            if not is_open(fresh):
+                return fresh["state"].lower()
+            if fresh["headRefOid"] != pr["headRefOid"]:
+                log(pr["label"], f"head moved away from {pr['headRefOid'][:8]} while "
+                                 f"merging, refusing")
+                return "head-changed"
+            if rerun_stale_codeql(fresh, stale_codeql_seconds):
+                reran_codeql = True
+                time.sleep(poll_interval)     # let GitHub re-queue the jobs
+                fresh = wait_for_ci(fresh)
+                if not is_open(fresh):
+                    return fresh["state"].lower()
+                attempt = 0                   # fresh budget for re-registration
+                continue
         time.sleep(poll_interval)
     return "rule-eval-timeout"
 
@@ -462,7 +499,7 @@ def wait_for_rebase(pr, poll_interval=15):
         return pr
 
 
-def wait_for_clean(pr, poll_interval=15, max_attempts=20, stale_codeql_seconds=120):
+def wait_for_clean(pr, poll_interval=15, max_attempts=20, stale_codeql_seconds=60):
     reran_codeql = False
     attempts = 0
     while attempts < max_attempts:
@@ -478,12 +515,8 @@ def wait_for_clean(pr, poll_interval=15, max_attempts=20, stale_codeql_seconds=1
         if (
             merge_state == "BLOCKED"
             and not reran_codeql
-            and codeql_settled(pr, stale_codeql_seconds)
+            and rerun_stale_codeql(pr, stale_codeql_seconds)
         ):
-            run_ids = codeql_run_ids(pr)
-            log(pr["label"], f"BLOCKED with CodeQL green >{stale_codeql_seconds}s, "
-                             f"re-running CodeQL runs {sorted(run_ids)}")
-            rerun_codeql(pr, run_ids)
             reran_codeql = True
             time.sleep(poll_interval)     # let GitHub re-queue the jobs
             pr = wait_for_ci(pr)          # wait out the fresh CodeQL run
