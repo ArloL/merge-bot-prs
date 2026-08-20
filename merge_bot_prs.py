@@ -731,7 +731,8 @@ def process_repository(prs, debug=False):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--count", type=int)
+    parser.add_argument("--count", type=int,
+                        help="process at most N PRs in total, across all passes")
     args = parser.parse_args()
 
     started = time.monotonic()
@@ -744,7 +745,12 @@ def main():
             if (pr["repository"], pr["number"]) not in processed
         ]
         if args.count is not None:
-            all_prs = all_prs[:args.count]
+            # Budget across the whole run, not per pass. Sliced per pass, this
+            # capped the batch size and then looped until the org was drained,
+            # so --count 20 was a throttle rather than a limit.
+            # max(0, ...) matters: a negative slice end would silently
+            # trim from the tail instead of yielding nothing.
+            all_prs = all_prs[:max(0, args.count - len(processed))]
 
         if not all_prs:
             break
