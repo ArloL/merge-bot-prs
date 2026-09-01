@@ -182,10 +182,10 @@ def is_currently_rebasing(pr):
     )
 
 
-def update_branch(pr):
+def update_branch(pr, poll_interval=5, max_attempts=12):
     """Rebase the branch onto its base via GitHub, bypassing the bot entirely.
 
-    Returns True if the branch was moved.
+    Returns the PR with its new head, or None if the branch did not move.
     """
     result = subprocess.run(
         ["gh", "pr", "update-branch", str(pr["number"]),
@@ -197,11 +197,24 @@ def update_branch(pr):
     if result.returncode != 0:
         log(pr["label"], f"update-branch failed: {result.stderr.strip()}",
             stream=sys.stderr)
-        return False
+        return None
+    # GitHub only queues the rebase, so for a few seconds afterwards the head
+    # still reads as the old SHA. Returning then hands the caller the *previous*
+    # head's rollup -- green, because that CI ran to completion -- and the PR
+    # looks ready to merge on checks nobody ran for the new commit.
     old_head = pr["headRefOid"]
-    new_head = get_pr(pr)["headRefOid"]
-    log(pr["label"], f"branch updated {old_head[:8]} -> {new_head[:8]}")
-    return True
+    for attempt in range(1, max_attempts + 1):
+        fresh = get_pr(pr)
+        if fresh["headRefOid"] != old_head:
+            log(pr["label"], f"branch updated {old_head[:8]} -> "
+                             f"{fresh['headRefOid'][:8]} (after {attempt} checks)")
+            return fresh
+        if not is_open(fresh):
+            return fresh
+        time.sleep(poll_interval)
+    log(pr["label"], f"head still {old_head[:8]} "
+                     f"{max_attempts * poll_interval}s after update-branch, giving up")
+    return None
 
 
 def rebase_already_triggered(pr):
@@ -605,7 +618,11 @@ def rebase_when_behind(pr, debug=False, poll_interval=15):
         # files it manages would change, so a PR sitting behind on unrelated
         # commits gets "already up-to-date" and never moves. Rebase it ourselves.
         log(pr["label"], f"behind by {behind}, rebasing via update-branch")
-        if not update_branch(pr):
+        fresh = update_branch(pr)
+        if fresh is None:
+            return pr
+        pr = fresh
+        if not is_open(pr):
             return pr
         # The rollup for the new head is empty until GitHub registers the
         # workflows, and an empty rollup reads as "CI passed".
