@@ -15,8 +15,12 @@ import threading
 import time
 import traceback
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
+
+# New bot PRs appear while a run is going -- a repo can hold a worker for hours
+# -- so the org is searched again on this interval rather than once per batch.
+SEARCH_INTERVAL = 300
 
 # Repos are processed in parallel, so lines from different PRs interleave.
 # The timestamp is what makes the resulting log readable after the fact, and
@@ -109,7 +113,7 @@ BOT_COMMIT_LOGINS = ("dependabot[bot]", "renovate[bot]")
 BOT_BRANCH_PREFIXES = ("dependabot/", "renovate/")
 
 
-def get_all_prs(organization="arlol", debug=False):
+def get_all_prs(organization="arlol", debug=False, quiet=False):
     prs = []
     for author in BOT_AUTHORS:
         prs_output = run_gh([
@@ -125,14 +129,15 @@ def get_all_prs(organization="arlol", debug=False):
         # archived:false is deliberate — archived repos are read-only, so their
         # PRs can be neither merged nor closed. Say so, otherwise the PRs they
         # hide look like PRs the script silently forgot.
-        log("[search]", f"{author}: {len(found)} open PRs (archived repos excluded)")
+        if not quiet:
+            log("[search]", f"{author}: {len(found)} open PRs (archived repos excluded)")
         prs.extend(found)
     result = [{
         "number": pr["number"],
         "repository": pr["repository"]["nameWithOwner"],
         "label": f"[{pr['repository']['nameWithOwner']}#{pr['number']}]",
     } for pr in prs]
-    if debug:
+    if debug and not quiet:
         by_repo = Counter(pr["repository"] for pr in result)
         for repository, count in sorted(by_repo.items()):
             log("[search]", f"  {repository}: {count}")
@@ -817,50 +822,73 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--count", type=int,
-                        help="process at most N PRs in total, across all passes")
+                        help="process at most N PRs in total, across the whole run")
     args = parser.parse_args()
 
     started = time.monotonic()
     processed = set()
     results = []
-    passes = 0
-    while True:
-        all_prs = [
-            pr for pr in get_all_prs(debug=args.debug)
-            if (pr["repository"], pr["number"]) not in processed
-        ]
-        if args.count is not None:
-            # Budget across the whole run, not per pass. Sliced per pass, this
-            # capped the batch size and then looped until the org was drained,
-            # so --count 20 was a throttle rather than a limit.
-            # max(0, ...) matters: a negative slice end would silently
-            # trim from the tail instead of yielding nothing.
-            all_prs = all_prs[:max(0, args.count - len(processed))]
+    rounds = 0
+    with ThreadPoolExecutor() as executor:
+        futures = {}          # future -> repository it is working
+        active = set()        # repositories with a worker in flight
+        searched = float("-inf")
+        while True:
+            # `wait` returns on the first repo to finish, so without this floor
+            # a burst of short repos would search once per completion. Two
+            # `gh search prs` calls each, against a 30/min search limit that
+            # answers 403 -- which is not transient, so it would end the run.
+            if futures and time.monotonic() - searched < SEARCH_INTERVAL:
+                fresh = []
+            else:
+                fresh = [
+                    pr for pr in get_all_prs(debug=args.debug, quiet=rounds > 0)
+                    if (pr["repository"], pr["number"]) not in processed
+                ]
+                searched = time.monotonic()
+            if args.count is not None:
+                # Budget across the whole run, not per round. Sliced per round,
+                # this capped the batch size and then looped until the org was
+                # drained, so --count 20 was a throttle rather than a limit.
+                # max(0, ...) matters: a negative slice end would silently
+                # trim from the tail instead of yielding nothing.
+                fresh = fresh[:max(0, args.count - len(processed))]
 
-        if not all_prs:
-            break
+            prs_by_repo = {}
+            for pr in fresh:
+                # PRs within a repo must stay serial -- merging one puts the
+                # next behind -- so a repo already working keeps its new PRs
+                # until its worker finishes and a later round picks them up.
+                if pr["repository"] not in active:
+                    prs_by_repo.setdefault(pr["repository"], []).append(pr)
 
-        processed.update((pr["repository"], pr["number"]) for pr in all_prs)
+            if prs_by_repo:
+                rounds += 1
+                log("[run]", f"round {rounds}: {sum(map(len, prs_by_repo.values()))} "
+                             f"PRs across {len(prs_by_repo)} repos, "
+                             f"processing repos in parallel")
+                for repository, prs in prs_by_repo.items():
+                    processed.update((p["repository"], p["number"]) for p in prs)
+                    active.add(repository)
+                    futures[executor.submit(process_repository, prs, args.debug)] = \
+                        repository
 
-        prs_by_repo = {}
-        for pr in all_prs:
-            prs_by_repo.setdefault(pr["repository"], []).append(pr)
+            if not futures:
+                break
 
-        passes += 1
-        log("[run]", f"pass {passes}: {len(all_prs)} PRs across "
-                     f"{len(prs_by_repo)} repos, processing repos in parallel")
-
-        with ThreadPoolExecutor() as executor:
-            futures = {
-                executor.submit(process_repository, prs, args.debug): repository
-                for repository, prs in prs_by_repo.items()
-            }
-            for future in as_completed(futures):
+            # Waiting on all of them was the bug this replaces: one slow repo
+            # held the search hostage for as long as it ran, so PRs opened
+            # meanwhile sat untouched. drifty took ~4h while the rest idled.
+            done, _ = wait(futures, return_when=FIRST_COMPLETED,
+                           timeout=max(0, SEARCH_INTERVAL
+                                          - (time.monotonic() - searched)))
+            for future in done:
                 results.extend(future.result())  # re-raise exceptions
+                active.discard(futures.pop(future))
 
     # The per-PR lines are interleaved across threads, so end with a flat
     # account of what happened to everything.
-    log("[run]", f"done: {len(results)} PRs in {passes} pass(es), "
+    log("[run]", f"done: {len(results)} PRs in {rounds} round(s), "
                  f"{round(time.monotonic() - started)}s total")
     for outcome, count in Counter(o for _, o, _ in results).most_common():
         log("[run]", f"  {outcome}: {count}")
