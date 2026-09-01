@@ -152,6 +152,14 @@ def get_pr(pr):
     return result
 
 
+def head_sha(pr):
+    """The head SHA per REST, which does not lag the way `gh pr view` does."""
+    return run_gh([
+        "api", f"repos/{pr['repository']}/pulls/{pr['number']}",
+        "--jq", ".head.sha",
+    ], label=pr["label"]).strip()
+
+
 def compare_counts(pr):
     """(ahead_by, behind_by) of the head against the base branch."""
     counts = run_gh([
@@ -182,7 +190,7 @@ def is_currently_rebasing(pr):
     )
 
 
-def update_branch(pr, poll_interval=5, max_attempts=12):
+def update_branch(pr, poll_interval=5, max_attempts=60):
     """Rebase the branch onto its base via GitHub, bypassing the bot entirely.
 
     Returns the PR with its new head, or None if the branch did not move.
@@ -198,10 +206,12 @@ def update_branch(pr, poll_interval=5, max_attempts=12):
         log(pr["label"], f"update-branch failed: {result.stderr.strip()}",
             stream=sys.stderr)
         return None
-    # GitHub only queues the rebase, so for a few seconds afterwards the head
-    # still reads as the old SHA. Returning then hands the caller the *previous*
-    # head's rollup -- green, because that CI ran to completion -- and the PR
-    # looks ready to merge on checks nobody ran for the new commit.
+    # GitHub only queues the rebase, and `gh pr view` reads a GraphQL replica
+    # that lags well behind it: on template-graal#58 the rebase commit existed
+    # 2s after this call (REST committer date) while `pr view` still served the
+    # old SHA a minute later. Returning early hands the caller the *previous*
+    # head's rollup -- green, because that CI ran to completion -- so the budget
+    # here is minutes, not seconds.
     old_head = pr["headRefOid"]
     for attempt in range(1, max_attempts + 1):
         fresh = get_pr(pr)
@@ -212,8 +222,11 @@ def update_branch(pr, poll_interval=5, max_attempts=12):
         if not is_open(fresh):
             return fresh
         time.sleep(poll_interval)
+    # REST is the side that was current, so it says which of the two this was:
+    # a rebase GitHub never performed, or one `pr view` still cannot see.
     log(pr["label"], f"head still {old_head[:8]} "
-                     f"{max_attempts * poll_interval}s after update-branch, giving up")
+                     f"{max_attempts * poll_interval}s after update-branch "
+                     f"(REST reads {head_sha(pr)[:8]}), giving up")
     return None
 
 
@@ -623,6 +636,12 @@ def wait_for_ci(pr, poll_interval=15):
 
 
 def rebase_when_behind(pr, debug=False, poll_interval=15):
+    """The PR brought up to date with its base, or None if that did not happen.
+
+    None is fail-closed on purpose: the caller still holds a PR whose rollup
+    belongs to the old head, and that rollup is green because that CI ran to
+    completion against a base that has since moved.
+    """
     ahead, behind = compare_counts(pr)
     if debug:
         log(pr["label"], f"ahead={ahead} behind={behind} base={pr['baseRefName']} "
@@ -637,7 +656,7 @@ def rebase_when_behind(pr, debug=False, poll_interval=15):
         log(pr["label"], f"behind by {behind}, rebasing via update-branch")
         fresh = update_branch(pr)
         if fresh is None:
-            return pr
+            return None
         pr = fresh
         if not is_open(pr):
             return pr
@@ -668,8 +687,10 @@ def refresh_stale_merge_ref(pr, debug=False):
     recorded, so it re-uploads SARIF for the merge commit nobody is asking about.
     Only a new head commit produces a merge ref CodeQL can analyse.
 
-    Returns the refreshed PR, or None if the branch is already up to date (in
-    which case code scanning is genuinely still registering and waiting is right).
+    Returns the refreshed PR, or None -- either because the branch is already up
+    to date, so code scanning is genuinely still registering and waiting is
+    right, or because the refresh did not land. Both callers treat None as "keep
+    waiting, then report BLOCKED", which is the safe reading of either.
     """
     _, behind = compare_counts(pr)
     if not behind:
@@ -708,7 +729,12 @@ def process_pr(pr, debug=False):
 
     label_names = {label["name"] for label in pr["labels"]}
     if label_names & {"github_actions", "github-actions"}:
-        pr = rebase_when_behind(pr, debug)
+        fresh = rebase_when_behind(pr, debug)
+        if fresh is None:
+            # Falling through here would read CI off the old head and merge on
+            # checks nobody ran against the current base.
+            return "rebase-stalled"
+        pr = fresh
         if not is_open(pr):
             return pr["state"].lower()
 
@@ -723,7 +749,10 @@ def process_pr(pr, debug=False):
 
     if not ci_passing:
         log(pr["label"], f"CI failing: {', '.join(failing_checks(pr)) or 'unknown'}")
-        pr = rebase_when_behind(pr, debug)
+        fresh = rebase_when_behind(pr, debug)
+        if fresh is None:
+            return "ci-failed"
+        pr = fresh
         if not is_open(pr):
             return pr["state"].lower()
         _, ci_passing = check_ci_status(pr)
