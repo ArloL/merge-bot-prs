@@ -233,16 +233,33 @@ def trigger_rebase(pr):
 DEPENDABOT_RECREATE = "@dependabot recreate"
 
 
-def recreate_already_requested(pr):
-    """True if our last word on this PR was already a recreate request.
+def head_committed_at(pr):
+    """When the current head commit was committed."""
+    return datetime.fromisoformat(run_gh(
+        ["api", f"repos/{pr['repository']}/commits/{pr['headRefOid']}",
+         "--jq", ".commit.committer.date"],
+        label=pr["label"],
+    ).strip())
 
-    Dependabot answers the comments it acts on, so an unanswered request means
-    it has not reached this one yet. Without this the script would re-comment
-    on every run -- #322 already carries two dead `@dependabot rebase` comments
-    from doing exactly that by hand.
+
+def recreate_already_requested(pr):
+    """True if a recreate we asked for is still outstanding.
+
+    The branch moving is the acknowledgement -- dependabot does *not* reply to
+    a recreate, so "our comment is the last one" is true forever once asked.
+    #322 was refused as `dirty` on every run for 12 days on that reading: the
+    2026-08-20 request was honoured, the branch was rebuilt on 2026-08-31, it
+    re-conflicted afterwards, and the guard still suppressed every new request.
+    A head newer than the last request means the bot acted and may be asked
+    again; anything older means it has not got there yet, and re-commenting
+    would just repeat the mess of two dead `@dependabot rebase` comments #322
+    already carries.
     """
-    comments = pr.get("comments") or []
-    return bool(comments) and DEPENDABOT_RECREATE in comments[-1]["body"]
+    requests = [comment for comment in (pr.get("comments") or [])
+                if DEPENDABOT_RECREATE in comment["body"]]
+    if not requests:
+        return False
+    return head_committed_at(pr) <= datetime.fromisoformat(requests[-1]["createdAt"])
 
 
 def request_branch_regeneration(pr):
