@@ -16,7 +16,7 @@ import time
 import traceback
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import UTC, datetime
+from datetime import datetime
 
 # Repos are processed in parallel, so lines from different PRs interleave.
 # The timestamp is what makes the resulting log readable after the fact, and
@@ -180,64 +180,6 @@ def is_currently_rebasing(pr):
         "Dependabot is rebasing this PR" in pr["body"]
         or "- [x] <!-- rebase-check -->" in pr["body"]
     )
-
-
-def _is_codeql_check(check):
-    text = ((check.get("workflowName") or "") + " " + (check.get("name") or "")).lower()
-    return "codeql" in text
-
-
-def codeql_settled(pr, min_age_seconds=120):
-    """True if every CodeQL-related check completed successfully at least
-    min_age_seconds ago — the fingerprint of GitHub's stale code-scanning bug,
-    distinct from a CodeQL run that is still legitimately in progress."""
-    codeql_checks = [c for c in pr["statusCheckRollup"] if _is_codeql_check(c)]
-    if not codeql_checks:
-        return False
-    now = datetime.now(UTC)
-    passing = {"SUCCESS", "NEUTRAL", "SKIPPED"}
-    for c in codeql_checks:
-        if c.get("status") != "COMPLETED" or c.get("conclusion") not in passing:
-            return False
-        completed_at = c.get("completedAt")
-        if not completed_at:
-            return False
-        age = (now - datetime.fromisoformat(completed_at)).total_seconds()
-        if age < min_age_seconds:
-            return False
-    return True
-
-
-def codeql_run_ids(pr):
-    """Workflow run ids backing the CodeQL Analysis checks on this PR."""
-    ids = set()
-    for c in pr["statusCheckRollup"]:
-        if not _is_codeql_check(c):
-            continue
-        match = re.search(r"/actions/runs/(\d+)", c.get("detailsUrl") or "")
-        if match:
-            ids.add(match.group(1))
-    return ids
-
-
-def rerun_codeql(pr, run_ids):
-    for run_id in run_ids:
-        # check=False: a stale/expired run that can't be re-run must not kill
-        # the whole process; we fall through and skip the PR instead.
-        run_gh(["run", "rerun", run_id, "--repo", pr["repository"]],
-               label=pr["label"], check=False)
-
-
-def rerun_stale_codeql(pr, min_age_seconds):
-    """Re-run CodeQL if every CodeQL check has been green for min_age_seconds.
-    Returns True if a re-run was kicked off."""
-    if not codeql_settled(pr, min_age_seconds):
-        return False
-    run_ids = codeql_run_ids(pr)
-    log(pr["label"], f"CodeQL green >{min_age_seconds}s but code scanning still "
-                     f"blocking, re-running runs {sorted(run_ids)}")
-    rerun_codeql(pr, run_ids)
-    return True
 
 
 def update_branch(pr):
@@ -460,16 +402,19 @@ MERGE_REFUSALS = {
     "This branch can't be rebased": "not-rebasable",
 }
 
+# The rule violation GitHub reports when a code_scanning ruleset has no analysis
+# for the PR's current merge ref.
+CODE_SCANNING_PENDING = "Code scanning is waiting for results"
 
-def merge_pr(pr, poll_interval=15, max_attempts=20, debug=False,
-             stale_codeql_seconds=60):
+
+def merge_pr(pr, poll_interval=15, max_attempts=20, debug=False):
     """Attempt merge, retrying while GitHub re-evaluates rules asynchronously.
 
     Returns the outcome: "merged", "head-changed" if something landed on the
-    branch after verify_pr vouched for it, or "rule-eval-timeout" if rule
-    evaluation never settles in time.
+    branch after verify_pr vouched for it, "stale-merge-ref" if code scanning is
+    blocking on a merge ref that base has moved out from under, or
+    "rule-eval-timeout" if rule evaluation never settles in time.
     """
-    reran_codeql = False
     attempt = 0
     while attempt < max_attempts:
         attempt += 1
@@ -508,29 +453,18 @@ def merge_pr(pr, poll_interval=15, max_attempts=20, debug=False,
             if debug:
                 print_merge_diagnostics(pr)
             raise GhError(result.stderr.strip())
+        # This, not BLOCKED in wait_for_clean, is where the stale merge ref
+        # usually surfaces: mergeStateStatus reads CLEAN and only the merge call
+        # admits code scanning is waiting on an analysis that will never arrive.
+        # Bail out rather than spend the budget on a wait that cannot succeed --
+        # the head has to move, and only process_pr may move it, because
+        # --match-head-commit is pinned to what verify_pr vouched for.
+        if CODE_SCANNING_PENDING in result.stderr and compare_counts(pr)[1]:
+            log(pr["label"], f"code scanning waiting on a merge ref base has "
+                             f"moved past: {result.stderr.strip()}")
+            return "stale-merge-ref"
         log(pr["label"], f"rule evaluation pending, waiting {poll_interval}s "
                          f"(attempt {attempt}/{max_attempts}): {result.stderr.strip()}")
-        # This, not BLOCKED in wait_for_clean, is where the stale code-scanning
-        # bug actually surfaces: mergeStateStatus reads CLEAN and only the merge
-        # call reports that code scanning is still waiting on a CodeQL run that
-        # finished long ago. Without a re-run here the loop just burns its whole
-        # budget and reports rule-eval-timeout.
-        if not reran_codeql:
-            fresh = get_pr(pr)
-            if not is_open(fresh):
-                return fresh["state"].lower()
-            if fresh["headRefOid"] != pr["headRefOid"]:
-                log(pr["label"], f"head moved away from {pr['headRefOid'][:8]} while "
-                                 f"merging, refusing")
-                return "head-changed"
-            if rerun_stale_codeql(fresh, stale_codeql_seconds):
-                reran_codeql = True
-                time.sleep(poll_interval)     # let GitHub re-queue the jobs
-                fresh = wait_for_ci(fresh)
-                if not is_open(fresh):
-                    return fresh["state"].lower()
-                attempt = 0                   # fresh budget for re-registration
-                continue
         time.sleep(poll_interval)
     return "rule-eval-timeout"
 
@@ -606,8 +540,8 @@ def wait_for_rebase(pr, poll_interval=15):
         return pr
 
 
-def wait_for_clean(pr, poll_interval=15, max_attempts=20, stale_codeql_seconds=60):
-    reran_codeql = False
+def wait_for_clean(pr, debug=False, poll_interval=15, max_attempts=20):
+    refreshed = False
     attempts = 0
     while attempts < max_attempts:
         pr = get_pr(pr)
@@ -619,18 +553,17 @@ def wait_for_clean(pr, poll_interval=15, max_attempts=20, stale_codeql_seconds=6
         if merge_state in {"DIRTY", "DRAFT"}:
             log(pr["label"], f"{merge_state} while waiting for clean, skipping")
             return pr
-        if (
-            merge_state == "BLOCKED"
-            and not reran_codeql
-            and rerun_stale_codeql(pr, stale_codeql_seconds)
-        ):
-            reran_codeql = True
-            time.sleep(poll_interval)     # let GitHub re-queue the jobs
-            pr = wait_for_ci(pr)          # wait out the fresh CodeQL run
-            if not is_open(pr):
-                return pr
-            attempts = 0                  # fresh budget for re-registration
-            continue
+        if merge_state == "BLOCKED" and not refreshed:
+            # Nothing is verified yet, so moving the head is free here -- unlike
+            # in merge_pr, where verify_pr has already vouched for a SHA.
+            fresh = refresh_stale_merge_ref(pr, debug)
+            refreshed = True
+            if fresh is not None:
+                pr = fresh
+                if not is_open(pr):
+                    return pr
+                attempts = 0              # fresh budget for the new merge ref
+                continue
         log(pr["label"], f"{merge_state}, waiting {poll_interval}s "
                          f"(attempt {attempts + 1}/{max_attempts})...")
         time.sleep(poll_interval)
@@ -691,6 +624,27 @@ def rebase_when_behind(pr, debug=False, poll_interval=15):
     return wait_for_ci(pr)
 
 
+def refresh_stale_merge_ref(pr, debug=False):
+    """Unstick a PR that code scanning refuses to clear, by giving it a new head.
+
+    CodeQL analyses refs/pull/N/merge -- the PR head merged with base *as of the
+    run*. When base moves, GitHub recomputes that ref to a new SHA and the
+    code_scanning ruleset finds no analysis for it, so it waits forever. Waiting
+    cannot help, and neither can `gh run rerun`: a re-run re-uses the SHA the run
+    recorded, so it re-uploads SARIF for the merge commit nobody is asking about.
+    Only a new head commit produces a merge ref CodeQL can analyse.
+
+    Returns the refreshed PR, or None if the branch is already up to date (in
+    which case code scanning is genuinely still registering and waiting is right).
+    """
+    _, behind = compare_counts(pr)
+    if not behind:
+        return None
+    log(pr["label"], f"code scanning blocked and behind by {behind}: base moved, "
+                     f"so the merge ref has no analysis -- refreshing the branch")
+    return rebase_when_behind(pr, debug)
+
+
 def process_pr(pr, debug=False):
     """Drive one PR as far as it will go. Returns a short outcome string.
 
@@ -747,19 +701,32 @@ def process_pr(pr, debug=False):
                          f"{', '.join(failing_checks(pr)) or 'unknown'}")
         return "ci-failed"
 
-    pr = wait_for_clean(pr)
-    if not is_open(pr):
-        return pr["state"].lower()
-    if pr["mergeStateStatus"] not in {"CLEAN", "HAS_HOOKS"}:
-        return f"not-mergeable-{pr['mergeStateStatus'].lower()}"
-    refusal = verify_pr(pr)
-    if refusal:
-        return f"unsafe-{refusal}"
-    outcome = merge_pr(pr, debug=debug)
-    if outcome == "not-rebasable" and request_branch_regeneration(pr):
-        # Otherwise this PR is refused identically on every future run while
-        # falling further behind -- the worst thing to accumulate unsupervised.
-        return "not-rebasable-regenerating"
+    # Two passes at most: a stale merge ref is fixed by giving the PR a new
+    # head, which invalidates verify_pr's verdict, so the whole tail has to run
+    # again against the refreshed branch. If base moves during our own CI the
+    # second pass is stale too -- report it and let the next run try.
+    for attempt in (1, 2):
+        pr = wait_for_clean(pr, debug)
+        if not is_open(pr):
+            return pr["state"].lower()
+        if pr["mergeStateStatus"] not in {"CLEAN", "HAS_HOOKS"}:
+            return f"not-mergeable-{pr['mergeStateStatus'].lower()}"
+        refusal = verify_pr(pr)
+        if refusal:
+            return f"unsafe-{refusal}"
+        outcome = merge_pr(pr, debug=debug)
+        if outcome == "not-rebasable" and request_branch_regeneration(pr):
+            # Otherwise this PR is refused identically on every future run while
+            # falling further behind -- the worst thing to accumulate unsupervised.
+            return "not-rebasable-regenerating"
+        if outcome != "stale-merge-ref" or attempt == 2:
+            return outcome
+        fresh = refresh_stale_merge_ref(pr, debug)
+        if fresh is None:
+            return outcome
+        pr = fresh
+        if not is_open(pr):
+            return pr["state"].lower()
     return outcome
 
 
