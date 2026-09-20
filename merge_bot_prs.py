@@ -59,6 +59,21 @@ class GhError(Exception):
     """
 
 
+def keep_awake():
+    """Hold off idle sleep for as long as this process lives.
+
+    A run waits on CI for hours; a sleeping Mac stops it mid-PR. caffeinate -w
+    watches our pid and exits on its own, so there is nothing to clean up on
+    any of the script's exit paths, including sys.exit from an uncaught GhError.
+    """
+    if sys.platform != "darwin":
+        return
+    try:
+        subprocess.Popen(["caffeinate", "-i", "-s", "-w", str(os.getpid())])
+    except OSError as error:
+        log("[run]", f"no caffeinate, the mac may sleep mid-run: {error}")
+
+
 def is_transient_gh_error(stderr):
     lowered = stderr.lower()
     return any(signature in lowered for signature in TRANSIENT_GH_ERRORS)
@@ -824,6 +839,8 @@ def main():
     parser.add_argument("--count", type=int,
                         help="process at most N PRs in total, across the whole run")
     args = parser.parse_args()
+
+    keep_awake()
 
     started = time.monotonic()
     processed = set()
