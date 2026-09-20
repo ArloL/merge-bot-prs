@@ -105,3 +105,64 @@ Useful detail that is on by default: the failing check names behind `ci_passing=
 - `DIRTY` — merge conflicts
 - `DRAFT` — draft PR
 - `UNSTABLE` — failing non-required checks
+
+# clear bot notifications
+
+`clear_bot_notifications.py` empties the GitHub notification inbox of things
+that never need a human: releases from the org's own repos, and dependabot or
+renovate PRs that have already been merged. It imports `run_gh`, `log`,
+`paginated` and `GhError` from `merge_bot_prs.py`.
+
+```
+uv run clear_bot_notifications.py             # unread only (the normal run)
+uv run clear_bot_notifications.py --dry-run
+uv run clear_bot_notifications.py --all       # sweep read notifications too
+```
+
+## REST cannot see "done", so unread is the only usable scope
+
+`DELETE /notifications/threads/{id}` marks a thread done; `PATCH` only marks it
+read. But **nothing reads the done bit back**. A thread marked done and one
+nobody has touched are identical over REST — both `unread: false`,
+`last_read_at: null` — and `?all=true` keeps returning done threads
+indefinitely. The web inbox's Unread/Read/Done/Saved states live in a store the
+REST API does not expose.
+
+Measured 2026-09-20, right after 344 threads were marked done by hand — the
+web UI and REST disagree completely about the same account:
+
+| | web UI | REST |
+| --- | --- | --- |
+| inbox | 57 (56 unread, 1 read) | no equivalent |
+| done | 521, a real folder | invisible |
+| filters | `is:done`, `is:unread`, `is:saved` | `all=true`/`all=false` |
+
+`?all=true` returned 561 that morning: every thread with recent activity,
+done or not. A `--all` dry run duly offered to clear 361 it had just cleared.
+
+Three consequences:
+
+- **The default scope is unread.** Marking done also clears unread, so that is
+  what makes a second run cheap and idempotent. `--all` is for a first
+  catch-up sweep and re-clears everything, every time it is used.
+- **The unread default misses read-but-not-done threads** — one of the 57
+  above. They are only reachable via `--all`, and only by re-clearing the
+  other 560 along the way.
+- **Verify with the unread count, never the `?all=true` count.** The latter
+  looks unchanged after a successful run and reads as a failure.
+
+There is no better API to switch to. GraphQL has no notifications schema at
+all — introspection turns up only org email restrictions and team settings —
+and REST silently ignores the web UI's `query` parameter: `?query=is:done`,
+`?query=is:unread` and `?query=garbage` all return the identical 578 threads.
+Done state is readable only from the web UI's own HTML.
+
+## Scope decisions
+
+- **Releases are filtered to the org, merged bot PRs are not.** A release from
+  someone else's project is something the user chose to watch; a merged bot PR
+  is finished business wherever it lives (the inbox carries them from
+  `haeger-sales-platform` too).
+- **Both bots count as merged-bot-pr**, via `BOT_COMMIT_LOGINS`. The REST
+  commits API spelling (`renovate[bot]`) is the right one here, not the app
+  slug `app/renovate` that `gh pr view --json author` returns.
