@@ -1,3 +1,5 @@
+Commit directly to `main`, no feature branch — single-owner repo with no PR workflow.
+
 # merge bot prs
 
 Script that auto-merges all open dependabot/renovate PRs across the `arlol` GitHub organization.
@@ -26,6 +28,8 @@ uv run merge_bot_prs.py --count 5     # process at most N PRs in total (useful f
 ```
 
 Requires `gh` CLI authenticated with sufficient org-level access.
+
+When a fix to `merge_bot_prs.py` lands mid-run, `pkill -f merge_bot_prs.py` and relaunch with the same flags — the running process keeps the old code for hours otherwise, and a fresh run re-finds every PR.
 
 ## How it works
 
