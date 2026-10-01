@@ -37,7 +37,9 @@ jobs:
   zizmor:
     runs-on: ubuntu-slim
     permissions:
+      actions: read
       contents: read
+      security-events: write
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
@@ -50,7 +52,12 @@ jobs:
         # renovate: datasource=pypi depName=zizmor
         ZIZMOR_VERSION: 1.30.1
       run: |
-        uvx --no-build "zizmor@${ZIZMOR_VERSION}" --format github .
+        uvx --no-build "zizmor@${ZIZMOR_VERSION}" --format sarif . > results.sarif
+    - name: Upload SARIF file
+      uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4.38.0
+      with:
+        category: zizmor
+        sarif_file: results.sarif
   required-status-check:
     name: check-actions.required-status-check
     needs:
