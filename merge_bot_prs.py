@@ -603,6 +603,22 @@ def wait_for_rebase(pr, poll_interval=15):
         return pr
 
 
+def wait_for_known_merge_state(pr, poll_interval=5, max_attempts=12):
+    """The PR once GitHub has finished recomputing mergeability.
+
+    Every merge into base resets its open PRs to UNKNOWN, so a repo's second
+    PR onwards routinely starts there. Read as-is, a conflicted PR slips past
+    the DIRTY check: angular-playground#380 went on to fail update-branch on
+    the conflict and was reported ci-failed instead of being regenerated.
+    """
+    for _ in range(max_attempts):
+        if pr["mergeStateStatus"] != "UNKNOWN" or not is_open(pr):
+            return pr
+        time.sleep(poll_interval)
+        pr = get_pr(pr)
+    return pr
+
+
 def wait_for_clean(pr, debug=False, poll_interval=15, max_attempts=20):
     refreshed = False
     attempts = 0
@@ -738,6 +754,7 @@ def process_pr(pr, debug=False):
         if not is_open(pr):
             return pr["state"].lower()
 
+    pr = wait_for_known_merge_state(pr)
     merge_state = pr["mergeStateStatus"]
     if merge_state == "DIRTY" and request_branch_regeneration(pr):
         # Same failure shape as not-rebasable: only the bot can resolve the
@@ -792,6 +809,9 @@ def process_pr(pr, debug=False):
         pr = wait_for_clean(pr, debug)
         if not is_open(pr):
             return pr["state"].lower()
+        # Base can move while we wait on CI, conflicting a PR that was fine.
+        if pr["mergeStateStatus"] == "DIRTY" and request_branch_regeneration(pr):
+            return "dirty-regenerating"
         if pr["mergeStateStatus"] not in {"CLEAN", "HAS_HOOKS"}:
             return f"not-mergeable-{pr['mergeStateStatus'].lower()}"
         refusal = verify_pr(pr)
