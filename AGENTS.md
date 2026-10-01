@@ -1,4 +1,4 @@
-Commit directly to `main`, no feature branch — single-owner repo with no PR workflow.
+Land changes via a branch and PR with auto-merge (`gh pr merge --auto --rebase`). The `main` ruleset requires status checks and has no bypass, so a direct push to `main` is rejected.
 
 # merge bot prs
 
