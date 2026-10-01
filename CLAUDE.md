@@ -167,7 +167,7 @@ Done state is readable only from the web UI's own HTML.
 - **Releases are filtered to the org, merged bot PRs are not.** A release from
   someone else's project is something the user chose to watch; a merged bot PR
   is finished business wherever it lives (the inbox carries them from
-  `haeger-sales-platform` too).
+  other orgs too).
 - **Both bots count as merged-bot-pr**, via `BOT_COMMIT_LOGINS`. The REST
   commits API spelling (`renovate[bot]`) is the right one here, not the app
   slug `app/renovate` that `gh pr view --json author` returns.
