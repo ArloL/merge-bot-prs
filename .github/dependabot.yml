@@ -1,0 +1,20 @@
+version: 2
+updates:
+- package-ecosystem: "github-actions"
+  directory: "/"
+  schedule:
+    interval: "monthly"
+  cooldown:
+    default-days: 7
+  open-pull-requests-limit: 10
+  groups:
+    github-codeql-action:
+      patterns:
+      - "github/codeql-action*"
+- package-ecosystem: "pip"
+  directory: "/"
+  schedule:
+    interval: "monthly"
+  cooldown:
+    default-days: 7
+  open-pull-requests-limit: 10

@@ -1,0 +1,70 @@
+name: Check actions
+
+on:
+  # push is limited to the trunk branch: pull_request covers every branch that
+  # has one, and a fork's pushes never reach this repository. workflow_dispatch
+  # is there for a branch with no pull request open.
+  push:
+    branches:
+    - main
+  pull_request:
+    branches:
+    - main
+  workflow_dispatch:
+  schedule:
+  - cron: "4 23 23 * *"
+permissions: {}
+
+jobs:
+  actionlint:
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        cache: false
+        go-version: stable
+    - name: run actionlint
+      env:
+        # renovate: datasource=go depName=actionlint.kjanat.dev
+        ACTIONLINT_VERSION: v1.17.0
+      run: |
+        go run "actionlint.kjanat.dev/cmd/actionlint@${ACTIONLINT_VERSION}"
+  zizmor:
+    runs-on: ubuntu-slim
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        persist-credentials: false
+    - name: Install the latest version of uv
+      uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+    - name: Run zizmor 🌈
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # renovate: datasource=pypi depName=zizmor
+        ZIZMOR_VERSION: 1.30.1
+      run: |
+        uvx --no-build "zizmor@${ZIZMOR_VERSION}" --format github .
+  required-status-check:
+    name: check-actions.required-status-check
+    needs:
+    - actionlint
+    - zizmor
+    # GitHub Actions skips this job when any of the dependents fail. And skips
+    # are considered success in their weird logic. So we always run it and fail
+    # ourselves if necessary
+    if: always()
+    runs-on: ubuntu-slim
+    steps:
+    - run: echo "Use this job as the required status check of this workflow"
+    - name: Check that all jobs were successful
+      env:
+        RESULTS: ${{ toJSON(needs) }}
+      run: |
+        echo "$RESULTS" | jq --exit-status 'all(.result == "success")' || exit 1
