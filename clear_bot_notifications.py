@@ -20,19 +20,17 @@ from merge_bot_prs import BOT_COMMIT_LOGINS, GhError, log, paginated, run_gh
 LOOKUP_WORKERS = 8
 
 
-def inbox(everything=False, label=""):
-    """Notifications to consider: unread by default, the whole list with
-    `everything`.
+def inbox(unread_only=False, label=""):
+    """Notifications to consider: the whole list by default, unread with
+    `unread_only`.
 
-    Unread is the default because it is the only state the script can see.
     REST models `unread` and nothing else -- a thread marked done is
-    indistinguishable from one nobody has touched, and `?all=true` goes on
-    returning done threads forever. Marking done also clears unread, so
-    scoping to unread is what keeps a second run from redoing the first.
-    `--all` exists for the initial catch-up sweep, and re-clears everything it
-    already cleared each time it is used.
+    indistinguishable from one nobody has touched. Reading a notification's
+    email marks it read but leaves it in the inbox, so the unread scope misses
+    most of what needs clearing. The whole list re-clears every thread already
+    done, each run; `--unread` is the cheap scope for when that matters.
     """
-    query = "all=true&per_page=100" if everything else "per_page=100"
+    query = "per_page=100" if unread_only else "all=true&per_page=100"
     return paginated(f"/notifications?{query}", label=label)
 
 
@@ -77,14 +75,14 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--org", default="arlol",
                         help="organization whose releases are cleared")
-    parser.add_argument("--all", action="store_true",
-                        help="sweep read notifications too, not just unread")
+    parser.add_argument("--unread", action="store_true",
+                        help="consider only unread notifications")
     parser.add_argument("--dry-run", action="store_true",
                         help="report what would be cleared, change nothing")
     args = parser.parse_args()
 
     started = time.monotonic()
-    notifications = inbox(args.all, "[inbox]")
+    notifications = inbox(args.unread, "[inbox]")
     log("[inbox]", f"{len(notifications)} notifications")
 
     outcomes = Counter()
