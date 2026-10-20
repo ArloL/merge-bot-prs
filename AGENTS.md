@@ -120,12 +120,12 @@ renovate PRs that have already been merged. It imports `run_gh`, `log`,
 `paginated` and `GhError` from `merge_bot_prs.py`.
 
 ```
-uv run clear_bot_notifications.py             # unread only (the normal run)
+uv run clear_bot_notifications.py             # every notification (the normal run)
 uv run clear_bot_notifications.py --dry-run
-uv run clear_bot_notifications.py --all       # sweep read notifications too
+uv run clear_bot_notifications.py --unread    # unread only
 ```
 
-## REST cannot see "done", so unread is the only usable scope
+## REST cannot see "done", so every run re-clears done threads
 
 `DELETE /notifications/threads/{id}` marks a thread done; `PATCH` only marks it
 read. But **nothing reads the done bit back**. A thread marked done and one
@@ -144,18 +144,17 @@ web UI and REST disagree completely about the same account:
 | filters | `is:done`, `is:unread`, `is:saved` | `all=true`/`all=false` |
 
 `?all=true` returned 561 that morning: every thread with recent activity,
-done or not. A `--all` dry run duly offered to clear 361 it had just cleared.
+done or not. A dry run duly offered to clear 361 it had just cleared.
 
 Three consequences:
 
-- **The default scope is unread.** Marking done also clears unread, so that is
-  what makes a second run cheap and idempotent. `--all` is for a first
-  catch-up sweep and re-clears everything, every time it is used.
-- **The unread default misses read-but-not-done threads** — one of the 57
-  above. They are only reachable via `--all`, and only by re-clearing the
-  other 560 along the way.
-- **Verify with the unread count, never the `?all=true` count.** The latter
-  looks unchanged after a successful run and reads as a failure.
+- **The default scope is every thread, not unread.** Reading a notification's
+  email marks it read but leaves it in the inbox, so an unread-only run missed
+  47 of 72 inbox threads on 2026-10-20. The price is re-clearing every done
+  thread with recent activity, each run; `--unread` is the cheap scope.
+- **Never verify with the `?all=true` count.** It looks unchanged after a
+  successful run and reads as a failure. The unread count is reliable but
+  only covers unread threads; the web inbox is the only full check.
 
 There is no better API to switch to. GraphQL has no notifications schema at
 all — introspection turns up only org email restrictions and team settings —
