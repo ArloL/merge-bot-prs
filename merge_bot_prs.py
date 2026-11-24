@@ -562,9 +562,8 @@ def check_pending(check):
     if "status" in check:
         # GitHub can leave status IN_PROGRESS on a finished check run:
         # rss-to-mail#532's `version` sat that way for a day with a conclusion
-        # and completedAt set. Both are only written on completion.
-        return (check["status"] != "COMPLETED"
-                and not check.get("conclusion") and not check.get("completedAt"))
+        # set. Not completedAt: gh reports an unset one as 0001-01-01T00:00:00Z.
+        return check["status"] != "COMPLETED" and not check.get("conclusion")
     return check.get("state") in {"EXPECTED", "PENDING"}
 
 
