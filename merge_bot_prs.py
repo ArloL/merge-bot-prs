@@ -558,15 +558,19 @@ def failing_checks(pr):
     ]
 
 
+def check_pending(check):
+    if "status" in check:
+        # GitHub can leave status IN_PROGRESS on a finished check run:
+        # rss-to-mail#532's `version` sat that way for a day with a conclusion
+        # and completedAt set. Both are only written on completion.
+        return (check["status"] != "COMPLETED"
+                and not check.get("conclusion") and not check.get("completedAt"))
+    return check.get("state") in {"EXPECTED", "PENDING"}
+
+
 def pending_checks(pr):
     """Names of checks that have not finished yet."""
-    return [
-        check_name(c)
-        for c in pr["statusCheckRollup"]
-        if (c.get("status", "COMPLETED") != "COMPLETED"
-            if "status" in c
-            else c.get("state") in {"EXPECTED", "PENDING"})
-    ]
+    return [check_name(c) for c in pr["statusCheckRollup"] if check_pending(c)]
 
 
 def check_ci_status(pr):
@@ -652,6 +656,14 @@ def wait_for_clean(pr, debug=False, poll_interval=15, max_attempts=20):
     return pr
 
 
+class CiTimeout(Exception):
+    """CI did not finish within CI_TIMEOUT; the PR's outcome is ci-timeout."""
+
+
+# The longest of 500 recent runs across the slowest repos took 108 minutes.
+CI_TIMEOUT = 2 * 60 * 60
+
+
 def wait_for_ci(pr, poll_interval=15):
     waited = 0
     while True:
@@ -660,6 +672,8 @@ def wait_for_ci(pr, poll_interval=15):
             log(pr["label"], f"{pr['state']} while waiting for CI")
             return pr
         pending = pending_checks(pr)
+        if pending and waited >= CI_TIMEOUT:
+            raise CiTimeout(f"still pending after {waited}s: {', '.join(sorted(pending))}")
         if pending:
             log(pr["label"], f"CI still running, waiting {poll_interval}s "
                              f"(waited {waited}s, pending: {', '.join(sorted(pending))})...")
@@ -840,6 +854,9 @@ def process_repository(prs, debug=False):
         started = time.monotonic()
         try:
             outcome = process_pr(get_pr(pr), debug=debug)
+        except CiTimeout as error:
+            outcome = "ci-timeout"
+            log(pr["label"], f"giving up on this PR: {error}")
         except GhError as error:
             outcome = "error-gh"
             log(pr["label"], f"giving up on this PR: {error}")
